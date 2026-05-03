@@ -1,0 +1,218 @@
+{
+  "summary": {
+    "total_frames": 16,
+    "fire_detected": 15,
+    "clear_frames": 1,
+    "fire_rate": 0.9375
+  },
+  "results": [
+    {
+      "frame_id": "frame_train_mm_fire_0094",
+      "filename": "frame_train_mm_fire_0094.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0437,
+        "YN": 0.0001,
+        "YY": 0.9562
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0113",
+      "filename": "frame_train_mm_fire_0113.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0001,
+        "YN": 0.0005,
+        "YY": 0.9994
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0114",
+      "filename": "frame_train_mm_fire_0114.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0028,
+        "YN": 0.0341,
+        "YY": 0.9631
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0115",
+      "filename": "frame_train_mm_fire_0115.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0015,
+        "YN": 0.1965,
+        "YY": 0.802
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0116",
+      "filename": "frame_train_mm_fire_0116.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0049,
+        "YN": 0.7552,
+        "YY": 0.2399
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0117",
+      "filename": "frame_train_mm_fire_0117.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0067,
+        "YN": 0.8328,
+        "YY": 0.1605
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0118",
+      "filename": "frame_train_mm_fire_0118.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0021,
+        "YN": 0.9812,
+        "YY": 0.0167
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0119",
+      "filename": "frame_train_mm_fire_0119.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0067,
+        "YN": 0.9867,
+        "YY": 0.0067
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0120",
+      "filename": "frame_train_mm_fire_0120.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0085,
+        "YN": 0.9839,
+        "YY": 0.0076
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0121",
+      "filename": "frame_train_mm_fire_0121.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0132,
+        "YN": 0.9773,
+        "YY": 0.0095
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0125",
+      "filename": "frame_train_mm_fire_0125.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0196,
+        "YN": 0.4079,
+        "YY": 0.5725
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0126",
+      "filename": "frame_train_mm_fire_0126.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0229,
+        "YN": 0.0464,
+        "YY": 0.9307
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0127",
+      "filename": "frame_train_mm_fire_0127.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0188,
+        "YN": 0.0037,
+        "YY": 0.9774
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0128",
+      "filename": "frame_train_mm_fire_0128.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0036,
+        "YN": 0.0002,
+        "YY": 0.9962
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_fire_0138",
+      "filename": "frame_train_mm_fire_0138.jpg",
+      "classifier_prediction": "YY",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.0011,
+        "YN": 0.0004,
+        "YY": 0.9985
+      },
+      "bounding_boxes": []
+    },
+    {
+      "frame_id": "frame_train_mm_nofire_0001",
+      "filename": "frame_train_mm_nofire_0001.jpg",
+      "classifier_prediction": "NN",
+      "fire_detected": false,
+      "phase2_localization": false,
+      "probabilities": {
+        "NN": 0.9977,
+        "YN": 0.0017,
+        "YY": 0.0006
+      },
+      "bounding_boxes": []
+    }
+  ]
+}
