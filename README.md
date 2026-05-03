@@ -1,6 +1,6 @@
 # VIP_FireDetection
 
-A hybrid deep learning + classical computer vision pipeline for real-time wildfire detection and localization from UAV-mounted multispectral sensors. The system ingests paired **RGB + Thermal/IR** frames and outputs fire presence decisions, spatial bounding boxes over detected fire regions, and structured coordinate data ready for handoff to a fire propagation model or geolocation module.
+A hybrid deep learning + classical computer vision pipeline for real-time wildfire detection and localization from UAV-mounted multispectral sensors. The system ingests paired **RGB + Thermal/IR** frames and outputs fire presence decisions, spatial fire boundary contours, and structured coordinate data ready for handoff to a fire propagation model or geolocation module.
 
 > **Design philosophy:** Deep learning answers *"Is there fire?"* — Classical CV answers *"Where is the fire?"*
 > This separation prioritizes computational efficiency, explainability, and onboard UAV deployability.
@@ -19,6 +19,7 @@ A hybrid deep learning + classical computer vision pipeline for real-time wildfi
   - [3. Evaluation](#3-evaluation)
   - [4. Inference](#4-inference)
   - [5. Localization](#5-localization)
+  - [6. Geolocation](#6-geolocation)
 - [Output Format](#output-format)
 - [Script Reference](#script-reference)
 - [Model Architecture](#model-architecture)
@@ -32,27 +33,32 @@ A hybrid deep learning + classical computer vision pipeline for real-time wildfi
 RGB + Thermal Frame Pair
         │
         ▼
-┌─────────────────────────┐
-│   Phase 1: MidFusionNet │  ← dual-branch ResNet-18 classifier
-│   Fire presence decision│    (NN / YN / YY)
-└─────────────────────────┘
+┌─────────────────────────────────────────────┐
+│   Phase 1: MidFusionNet                     │  ← dual-branch ResNet-18 classifier
+│   Fire presence decision (NN / YN / YY)     │
+└─────────────────────────────────────────────┘
         │
         ├── No fire → skip (zero localization compute)
         │
         ▼
-┌─────────────────────────┐
-│   Phase 2: Localization │  ← classical CV pipeline
-│   Otsu Thresholding     │
-│   MSER Extraction       │
-│   Mask × MSER Fusion    │
-│   NMS + Containment     │
-└─────────────────────────┘
+┌─────────────────────────────────────────────┐
+│   Phase 2: Localization                     │  ← classical CV pipeline
+│   Otsu Thresholding + Threshold Scaling     │
+│   Mask Dilation (region merging)            │
+│   Contour Extraction (approxPolyDP)         │
+│   Area Filtering                            │
+└─────────────────────────────────────────────┘
         │
         ▼
-  Bounding Boxes (pixel + normalized)
+┌─────────────────────────────────────────────┐
+│   Phase 3: Geolocation                      │  ← geolocate.py (stub)
+│   MAVLink v2 telemetry parsing              │
+│   Pinhole camera back-projection            │
+│   GPS polygon + fire wavefront arc output   │
+└─────────────────────────────────────────────┘
         │
         ▼
-  (Future) Geolocation → GPS World Coordinates
+  Fire propagation model input
 ```
 
 **Label classes:**
@@ -87,8 +93,9 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── model.py            # MidFusionNet architecture definition
 ├── train.py            # Training loop
 ├── evaluate.py         # Test set evaluation with confusion matrix
-├── infer.py            # Phase 1 inference on arbitrary image pairs
-├── localize.py         # Phase 2 fire region localization pipeline
+├── infer.py            # Phase 1: inference on arbitrary image pairs
+├── localize.py         # Phase 2: fire region localization (contour-based)
+├── geolocate.py        # Phase 3: GPS back-projection (fully specified stub)
 │
 ├── dataset_processed/  # Output of preprocessing (aligned 256×256 pairs)
 │   ├── rgb/
@@ -111,8 +118,13 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 
 ```bash
 git clone https://github.com/NinjaMonkey06/VIP_FireDetection
-cd uav-fire-detection
+cd VIP_FireDetection
 pip install torch torchvision opencv-python pillow matplotlib scikit-learn pandas numpy
+```
+
+For Phase 3 geolocation (once implementing `geolocate.py`):
+```bash
+pip install pymavlink pyproj
 ```
 
 > **Note:** CUDA is supported automatically. The scripts fall back to CPU if no GPU is available.
@@ -188,57 +200,97 @@ python infer.py \
 | `--thermal_dir` | required | Path to folder of thermal images |
 | `--checkpoint` | required | Path to `.pth` model checkpoint |
 | `--output_json` | `inference_results.json` | Path to save structured results |
-| `--visualize` | off | Save 3-panel visualization figures |
+| `--visualize` | off | Save 3-panel visualization figures (RGB / Thermal / confidence bars) |
 | `--vis_dir` | `inference_vis/` | Output folder for visualizations |
 
 ---
 
 ### 5. Localization
 
-Runs the Phase 2 classical CV localization pipeline on all fire-positive frames from `inference_results.json`. **Must be run after `infer.py`.**
+Runs the Phase 2 classical CV localization pipeline on all fire-positive frames from `inference_results.json`. **Must be run after `infer.py`.** Clear frames are skipped entirely — zero additional compute incurred.
 
 ```bash
-# Minimal
+# Minimal — JSON output
 python localize.py \
   --inference_json inference_results.json \
   --thermal_dir custom_test/thermal
 
-# With 4-panel visualization (include --rgb_dir for the RGB panel)
+# With 5-panel visualization (include --rgb_dir for the RGB panel)
 python localize.py \
   --inference_json inference_results.json \
   --thermal_dir custom_test/thermal \
   --rgb_dir custom_test/rgb \
   --visualize
 
-# Manual parameter tuning
+# GeoJSON output for mapping tools
 python localize.py \
   --inference_json inference_results.json \
   --thermal_dir custom_test/thermal \
-  --mser_min_area 100 \
-  --mask_overlap_ratio 0.3 \
-  --nms_iou_threshold 0.15 \
+  --output_format geojson
+
+# Parameter tuning example
+python localize.py \
+  --inference_json inference_results.json \
+  --thermal_dir custom_test/thermal \
+  --threshold_scale 0.8 \
+  --merge_kernel_size 20 \
+  --epsilon_factor 0.005 \
   --visualize
 ```
-
-**Clear frames are skipped entirely** — localization compute is only incurred on fire-positive frames, directly simulating efficient onboard UAV inference.
 
 **Tunable parameters:**
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--otsu_blur_kernel` | `5` | Gaussian blur kernel before Otsu thresholding. Set to `1` to disable. |
-| `--mser_delta` | `3` | MSER stability threshold. Lower = more regions detected. |
-| `--mser_min_area` | `150` | Minimum MSER region area (pixels at 256×256). Increase to filter noise. |
-| `--mser_max_area` | `6000` | Maximum MSER region area. Decrease if background regions appear. |
-| `--mask_overlap_ratio` | `0.35` | Minimum fraction of MSER box pixels that must overlap the Otsu mask. |
-| `--nms_iou_threshold` | `0.2` | IoU threshold for NMS. Lower = more aggressive suppression. |
-| `--containment_threshold` | `0.85` | Fraction of a smaller box inside a larger box to trigger suppression. |
+| `--otsu_blur_kernel` | `5` | Gaussian blur kernel before Otsu. Set to `1` to disable. |
+| `--threshold_scale` | `0.85` | Scales Otsu threshold down to capture dimmer fire regions. Set to `1.0` for pure Otsu. |
+| `--merge_kernel_size` | `15` | Dilation kernel size for merging nearby fire regions. Regions within ~kernel/2 px of each other are merged. Set to `0` to disable. |
+| `--min_contour_area` | `200` | Minimum contour area in pixels at 256×256. Filters noise fragments. |
+| `--max_contour_area` | `50000` | Maximum contour area in pixels at 256×256. Prevents background capture. |
+| `--epsilon_factor` | `0.01` | `approxPolyDP` epsilon as fraction of contour perimeter. Lower = denser vertices, better arc coverage. |
+| `--output_format` | `json` | Output format: `json` / `geojson` / `csv` |
+| `--visualize` | off | Save 5-panel figures per frame |
+| `--vis_dir` | `localization_vis/` | Output folder for visualizations |
 
-**Parameter presets observed during testing:**
+**Localization evolution — parameter presets:**
 
-| Preset | `mser_min_area` | `nms_iou_threshold` | Containment | Boxes per frame |
-|--------|----------------|---------------------|-------------|-----------------|
-| v1 (fine-grained) | 60 | 0.3 | None | Up to 44 |
-| v2 (default) | 150 | 0.2 | 0.85 | 2 – 15 |
+| Version | Approach | Key settings | Output |
+|---------|----------|-------------|--------|
+| v1 | MSER + NMS | `mser_min_area=60`, `iou=0.3` | Up to 44 boxes/frame |
+| v2 | MSER + NMS (tuned) | `mser_min_area=150`, `iou=0.2`, containment suppression | 2–15 boxes/frame |
+| v3 | Contour extraction | `epsilon=0.02`, pure Otsu, no merging | Fire boundary polygons |
+| v4 (current) | Contour + merging | `threshold_scale=0.85`, `merge_kernel=15`, `epsilon=0.01` | Merged polygons, denser arcs |
+
+---
+
+### 6. Geolocation
+
+`geolocate.py` is a **fully specified implementation stub** for Phase 3. It converts normalized image-space fire contour points from `localize.py` to GPS world coordinates using drone telemetry and camera intrinsics, then outputs GPS fire boundary polygons and simplified wavefront arc polylines for the fire propagation model.
+
+**Hardware specification (confirmed):**
+| Component | Specification |
+|-----------|--------------|
+| Thermal camera | FLIR HADRON 640R+, 13.6mm lens, 60Hz |
+| Altitude | Barometric + GPS fusion |
+| Gimbal | Real-time angle telemetry (pitch, roll, yaw) |
+| Telemetry format | MAVLink v2 over serial |
+
+```bash
+# Once implemented:
+python geolocate.py \
+  --localization_json localization_results.json \
+  --telemetry_log flight.tlog \
+  --output_format geojson \
+  --wind_direction_deg 270
+```
+
+**To implement `geolocate.py`:**
+1. Install dependencies: `pip install pymavlink pyproj`
+2. Obtain a MAVLink v2 `.tlog` or `.bin` telemetry log from a test flight
+3. Confirm camera model is FLIR HADRON 640R+ with 13.6mm lens (re-derive intrinsics from spec sheet if different)
+4. Confirm whether gimbal angles are world-referenced or body-referenced (affects rotation matrix construction)
+5. Translate each pseudocode stub function to Python — all math is fully specified in the file
+
+The stub contains: camera intrinsic derivation, MAVLink message parsing, Euler→rotation matrix, pinhole back-projection math, wind-guided wavefront arc extraction, and all three output formatters. No additional design decisions are required.
 
 ---
 
@@ -261,8 +313,7 @@ python localize.py \
       "classifier_prediction": "YN",
       "fire_detected": true,
       "phase2_localization": true,
-      "probabilities": { "NN": 0.02, "YN": 0.91, "YY": 0.07 },
-      "bounding_boxes": []
+      "probabilities": { "NN": 0.02, "YN": 0.91, "YY": 0.07 }
     }
   ]
 }
@@ -274,12 +325,12 @@ python localize.py \
 {
   "summary": {
     "localization_run_on": 40,
-    "frames_with_boxes": 38,
+    "frames_with_regions": 38,
     "fire_detected_no_regions": 2,
     "parameters": {
-      "mser_delta": 3,
-      "mser_min_area": 150,
-      "nms_iou_threshold": 0.2
+      "threshold_scale": 0.85,
+      "merge_kernel_size": 15,
+      "epsilon_factor": 0.01
     }
   },
   "results": [
@@ -288,13 +339,17 @@ python localize.py \
       "fire_detected": true,
       "localization_run": true,
       "otsu_threshold": 187,
-      "mser_candidates": 23,
-      "post_fusion_candidates": 6,
-      "bounding_boxes": [
+      "applied_threshold": 158,
+      "n_raw_contours": 3,
+      "fire_regions": [
         {
-          "pixel_256": { "x": 112, "y": 88, "w": 45, "h": 38 },
-          "normalized": { "x": 0.4375, "y": 0.3437, "w": 0.1757, "h": 0.1484 },
-          "original_wh": { "width": 640, "height": 512 }
+          "pixel_256": [{"x": 112, "y": 88}, {"x": 134, "y": 91}, "..."],
+          "normalized": [{"x": 0.4375, "y": 0.3437}, {"x": 0.5234, "y": 0.3554}, "..."],
+          "area_px": 1823.5,
+          "n_points": 14,
+          "original_wh": {"width": 640, "height": 512},
+          "gps_polygon": null,
+          "fire_front_arc": null
         }
       ]
     }
@@ -303,9 +358,17 @@ python localize.py \
 ```
 
 **Coordinate systems:**
-- `pixel_256` — coordinates in the 256×256 processing space
-- `normalized` — resolution-agnostic [0,1] coordinates; multiply by any target resolution to remap. This is what the geolocation stage will consume.
+- `pixel_256` — ordered contour points in 256×256 processing space
+- `normalized` — same points in [0,1] range, resolution-agnostic. This is what `geolocate.py` consumes to back-project to GPS coordinates.
 - `original_wh` — actual thermal image dimensions at inference time, for reference
+- `gps_polygon` / `fire_front_arc` — null placeholders populated by `geolocate.py`
+
+**Output format options (`--output_format`):**
+| Format | File | Best for |
+|--------|------|----------|
+| `json` | `localization_results.json` | Pipeline-internal use, full fidelity |
+| `geojson` | `localization_results.geojson` | GIS tools (QGIS, Mapbox, Google Earth) |
+| `csv` | `localization_results.csv` | Simple downstream consumption, custom propagation model |
 
 ---
 
@@ -318,8 +381,9 @@ python localize.py \
 | `model.py` | `MidFusionNet` — dual-branch ResNet-18 mid-fusion classifier |
 | `train.py` | Training loop — Adam, Cross-Entropy, 15 epochs, saves `.pth` checkpoint |
 | `evaluate.py` | Test set evaluation — confusion matrix display |
-| `infer.py` | Phase 1 inference on arbitrary image pairs, outputs JSON + optional visualizations |
-| `localize.py` | Phase 2 localization — Otsu → MSER → mask fusion → NMS, outputs JSON + optional visualizations |
+| `infer.py` | Phase 1 inference on arbitrary image pairs — outputs JSON + optional 3-panel visualizations |
+| `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
+| `geolocate.py` | Phase 3 GPS back-projection stub — fully specified pseudocode, ready to implement |
 
 ---
 
@@ -367,7 +431,8 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Thermal palette domain shift** — the model was trained on a single sensor platform. Different thermal cameras apply different color mappings, which can cause misclassification on out-of-distribution hardware. Mitigation: cross-sensor normalization or multi-platform fine-tuning.
 - **Fixed processing resolution** — both modalities are resized to 256×256. Small or distant fire regions may lose spatial detail. A multiscale inference approach could improve small-source detection.
 - **No temporal modeling** — frames are processed independently. A UAV video stream has strong temporal correlation that is currently unused.
-- **Geolocation not yet implemented** — normalized bounding box coordinates are structured and ready for the geolocation module (requires drone altitude, GPS, gimbal angle, and thermal camera intrinsics).
+- **Flat-earth geolocation assumption** — the back-projection in `geolocate.py` assumes flat terrain at the drone's GPS altitude. Mountainous terrain requires DEM (Digital Elevation Model) intersection for accurate GPS projection.
+- **Geolocation not yet implemented** — `geolocate.py` is a fully specified stub. Normalized contour coordinates are structured and ready; implementation requires a MAVLink telemetry log and `pymavlink` / `pyproj`.
 
 ---
 
