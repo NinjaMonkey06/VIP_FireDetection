@@ -1,0 +1,408 @@
+{
+  "summary": {
+    "total_frames": 7,
+    "fire_detected": 6,
+    "clear_frames": 1,
+    "fire_rate": 0.857
+  },
+  "results": [
+    {
+      "frame_id": "frame_000",
+      "filename": "frame_000.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.02,
+        "YN": 0.9,
+        "YY": 0.08
+      },
+      "localization_run": true,
+      "otsu_threshold": 150,
+      "applied_threshold": 130,
+      "n_raw_contours": 1,
+      "fire_regions": [
+        {
+          "pixel_256": [
+            {
+              "x": 90,
+              "y": 118
+            },
+            {
+              "x": 110,
+              "y": 118
+            },
+            {
+              "x": 110,
+              "y": 138
+            },
+            {
+              "x": 90,
+              "y": 138
+            }
+          ],
+          "normalized": [
+            {
+              "x": 0.351562,
+              "y": 0.460938
+            },
+            {
+              "x": 0.429688,
+              "y": 0.460938
+            },
+            {
+              "x": 0.429688,
+              "y": 0.539062
+            },
+            {
+              "x": 0.351562,
+              "y": 0.539062
+            }
+          ],
+          "area_px": 400.0,
+          "n_points": 4,
+          "original_wh": {
+            "width": 640,
+            "height": 512
+          },
+          "gps_polygon": null,
+          "fire_front_arc": null
+        }
+      ]
+    },
+    {
+      "frame_id": "frame_001",
+      "filename": "frame_001.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.02,
+        "YN": 0.9,
+        "YY": 0.08
+      },
+      "localization_run": true,
+      "otsu_threshold": 150,
+      "applied_threshold": 130,
+      "n_raw_contours": 1,
+      "fire_regions": [
+        {
+          "pixel_256": [
+            {
+              "x": 98,
+              "y": 118
+            },
+            {
+              "x": 118,
+              "y": 118
+            },
+            {
+              "x": 118,
+              "y": 138
+            },
+            {
+              "x": 98,
+              "y": 138
+            }
+          ],
+          "normalized": [
+            {
+              "x": 0.382812,
+              "y": 0.460938
+            },
+            {
+              "x": 0.460938,
+              "y": 0.460938
+            },
+            {
+              "x": 0.460938,
+              "y": 0.539062
+            },
+            {
+              "x": 0.382812,
+              "y": 0.539062
+            }
+          ],
+          "area_px": 400.0,
+          "n_points": 4,
+          "original_wh": {
+            "width": 640,
+            "height": 512
+          },
+          "gps_polygon": null,
+          "fire_front_arc": null
+        }
+      ]
+    },
+    {
+      "frame_id": "frame_002",
+      "filename": "frame_002.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.02,
+        "YN": 0.9,
+        "YY": 0.08
+      },
+      "localization_run": true,
+      "otsu_threshold": 150,
+      "applied_threshold": 130,
+      "n_raw_contours": 1,
+      "fire_regions": [
+        {
+          "pixel_256": [
+            {
+              "x": 106,
+              "y": 117
+            },
+            {
+              "x": 126,
+              "y": 117
+            },
+            {
+              "x": 126,
+              "y": 137
+            },
+            {
+              "x": 106,
+              "y": 137
+            }
+          ],
+          "normalized": [
+            {
+              "x": 0.414062,
+              "y": 0.457031
+            },
+            {
+              "x": 0.492188,
+              "y": 0.457031
+            },
+            {
+              "x": 0.492188,
+              "y": 0.535156
+            },
+            {
+              "x": 0.414062,
+              "y": 0.535156
+            }
+          ],
+          "area_px": 400.0,
+          "n_points": 4,
+          "original_wh": {
+            "width": 640,
+            "height": 512
+          },
+          "gps_polygon": null,
+          "fire_front_arc": null
+        }
+      ]
+    },
+    {
+      "frame_id": "frame_003",
+      "filename": "frame_003.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.02,
+        "YN": 0.9,
+        "YY": 0.08
+      },
+      "localization_run": true,
+      "otsu_threshold": 150,
+      "applied_threshold": 130,
+      "n_raw_contours": 1,
+      "fire_regions": [
+        {
+          "pixel_256": [
+            {
+              "x": 114,
+              "y": 117
+            },
+            {
+              "x": 134,
+              "y": 117
+            },
+            {
+              "x": 134,
+              "y": 137
+            },
+            {
+              "x": 114,
+              "y": 137
+            }
+          ],
+          "normalized": [
+            {
+              "x": 0.445312,
+              "y": 0.457031
+            },
+            {
+              "x": 0.523438,
+              "y": 0.457031
+            },
+            {
+              "x": 0.523438,
+              "y": 0.535156
+            },
+            {
+              "x": 0.445312,
+              "y": 0.535156
+            }
+          ],
+          "area_px": 400.0,
+          "n_points": 4,
+          "original_wh": {
+            "width": 640,
+            "height": 512
+          },
+          "gps_polygon": null,
+          "fire_front_arc": null
+        }
+      ]
+    },
+    {
+      "frame_id": "frame_004",
+      "filename": "frame_004.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.02,
+        "YN": 0.9,
+        "YY": 0.08
+      },
+      "localization_run": true,
+      "otsu_threshold": 150,
+      "applied_threshold": 130,
+      "n_raw_contours": 1,
+      "fire_regions": [
+        {
+          "pixel_256": [
+            {
+              "x": 122,
+              "y": 116
+            },
+            {
+              "x": 142,
+              "y": 116
+            },
+            {
+              "x": 142,
+              "y": 136
+            },
+            {
+              "x": 122,
+              "y": 136
+            }
+          ],
+          "normalized": [
+            {
+              "x": 0.476562,
+              "y": 0.453125
+            },
+            {
+              "x": 0.554688,
+              "y": 0.453125
+            },
+            {
+              "x": 0.554688,
+              "y": 0.53125
+            },
+            {
+              "x": 0.476562,
+              "y": 0.53125
+            }
+          ],
+          "area_px": 400.0,
+          "n_points": 4,
+          "original_wh": {
+            "width": 640,
+            "height": 512
+          },
+          "gps_polygon": null,
+          "fire_front_arc": null
+        }
+      ]
+    },
+    {
+      "frame_id": "frame_005",
+      "filename": "frame_005.jpg",
+      "classifier_prediction": "NN",
+      "fire_detected": false,
+      "phase2_localization": false,
+      "probabilities": {
+        "NN": 0.95,
+        "YN": 0.03,
+        "YY": 0.02
+      },
+      "localization_run": false,
+      "localization_note": "Skipped \u2014 classifier predicted no fire"
+    },
+    {
+      "frame_id": "frame_006",
+      "filename": "frame_006.jpg",
+      "classifier_prediction": "YN",
+      "fire_detected": true,
+      "phase2_localization": true,
+      "probabilities": {
+        "NN": 0.05,
+        "YN": 0.85,
+        "YY": 0.1
+      },
+      "localization_run": true,
+      "otsu_threshold": 150,
+      "applied_threshold": 130,
+      "n_raw_contours": 1,
+      "fire_regions": [
+        {
+          "pixel_256": [
+            {
+              "x": 130,
+              "y": 116
+            },
+            {
+              "x": 150,
+              "y": 116
+            },
+            {
+              "x": 150,
+              "y": 136
+            },
+            {
+              "x": 130,
+              "y": 136
+            }
+          ],
+          "normalized": [
+            {
+              "x": 0.507812,
+              "y": 0.453125
+            },
+            {
+              "x": 0.585938,
+              "y": 0.453125
+            },
+            {
+              "x": 0.585938,
+              "y": 0.53125
+            },
+            {
+              "x": 0.507812,
+              "y": 0.53125
+            }
+          ],
+          "area_px": 400.0,
+          "n_points": 4,
+          "original_wh": {
+            "width": 640,
+            "height": 512
+          },
+          "gps_polygon": null,
+          "fire_front_arc": null
+        }
+      ]
+    }
+  ]
+}

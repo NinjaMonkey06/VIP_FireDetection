@@ -51,9 +51,10 @@ RGB + Thermal Frame Pair
         │
         ▼
 ┌─────────────────────────────────────────────┐
-│   Phase 3: Geolocation                      │  ← geolocate.py (stub)
-│   MAVLink v2 telemetry parsing              │
+│   Phase 3: Geolocation + Tracking           │  ← geolocate.py
+│   MAVLink v2 telemetry (real or simulated)  │
 │   Pinhole camera back-projection            │
+│   Cross-frame fire tracking + velocity      │
 │   GPS polygon + fire wavefront arc output   │
 └─────────────────────────────────────────────┘
         │
@@ -262,9 +263,9 @@ python localize.py \
 
 ---
 
-### 6. Geolocation
+### 6. Geolocation + Fire Tracking
 
-`geolocate.py` is a **fully specified implementation stub** for Phase 3. It converts normalized image-space fire contour points from `localize.py` to GPS world coordinates using drone telemetry and camera intrinsics, then outputs GPS fire boundary polygons and simplified wavefront arc polylines for the fire propagation model.
+`geolocate.py` is **implemented** (no longer a stub). It converts normalized image-space fire contour points from `localize.py` to GPS world coordinates using drone telemetry and camera intrinsics, **tracks each fire region across the frame sequence, and estimates a velocity vector (speed + heading) per track** from GPS centroid displacement over time. It then outputs GPS fire boundary polygons and wavefront arc polylines — using wind direction if provided, otherwise falling back to the fire's own tracked movement heading — ready for the fire propagation model.
 
 **Hardware specification (confirmed):**
 | Component | Specification |
@@ -274,23 +275,37 @@ python localize.py \
 | Gimbal | Real-time angle telemetry (pitch, roll, yaw) |
 | Telemetry format | MAVLink v2 over serial |
 
+Two telemetry sources are supported — swap `--telemetry_log` in once a real flight log exists, no other code changes needed:
+
 ```bash
-# Once implemented:
+# With a real MAVLink log:
 python geolocate.py \
   --localization_json localization_results.json \
   --telemetry_log flight.tlog \
   --output_format geojson \
   --wind_direction_deg 270
+
+# Without a flight log yet — simulated straight-line flight (for dev/testing):
+python geolocate.py \
+  --localization_json localization_results.json \
+  --simulate_telemetry \
+  --sim_start_lat 34.1500 --sim_start_lon -117.8500 \
+  --sim_altitude_m 80 --sim_heading_deg 90 --sim_speed_mps 8 \
+  --fps 1.0
+
+# Sanity-check the math (no files needed):
+python geolocate.py --self_test
 ```
 
-**To implement `geolocate.py`:**
-1. Install dependencies: `pip install pymavlink pyproj`
-2. Obtain a MAVLink v2 `.tlog` or `.bin` telemetry log from a test flight
-3. Confirm camera model is FLIR HADRON 640R+ with 13.6mm lens (re-derive intrinsics from spec sheet if different)
-4. Confirm whether gimbal angles are world-referenced or body-referenced (affects rotation matrix construction)
-5. Translate each pseudocode stub function to Python — all math is fully specified in the file
+**Fire tracking / velocity:** each fire region is matched across frames by nearest GPS centroid (gated by `--max_track_distance_m`), producing a persistent `track_id`. Each region gets `velocity_mps`, `velocity_smoothed_mps` (moving average, window `--track_smoothing_window`), and `heading_deg` (degrees from North). Tracks tolerate up to `--max_coast_frames` consecutive frames with no matching detection (e.g. one missed frame) before being marked lost. Full per-track trajectory history is included in the output under `"tracks"`.
 
-The stub contains: camera intrinsic derivation, MAVLink message parsing, Euler→rotation matrix, pinhole back-projection math, wind-guided wavefront arc extraction, and all three output formatters. No additional design decisions are required.
+**Known limitation:** `infer.py`/`localize.py` don't yet record a per-frame capture timestamp, so `geolocate.py` currently assigns timestamps sequentially from `--fps` in frame order. This is fine for `--simulate_telemetry` (generated on the same clock) but is an approximation for real flights — for rigorous results, add a real capture timestamp to `inference_results.json` upstream.
+
+**Dependencies:**
+```bash
+pip install pymavlink   # only needed for --telemetry_log with a real .tlog/.bin
+```
+`pyproj` is not required — GPS math uses the spherical-earth approximation specified in the design (haversine distance, equirectangular local-meters conversion), matching the original spec.
 
 ---
 
@@ -383,7 +398,7 @@ The stub contains: camera intrinsic derivation, MAVLink message parsing, Euler�
 | `evaluate.py` | Test set evaluation — confusion matrix display |
 | `infer.py` | Phase 1 inference on arbitrary image pairs — outputs JSON + optional 3-panel visualizations |
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
-| `geolocate.py` | Phase 3 GPS back-projection stub — fully specified pseudocode, ready to implement |
+| `geolocate.py` | Phase 3 — GPS back-projection, fire tracking, and velocity vector estimation. Supports real MAVLink logs or simulated telemetry. |
 
 ---
 
@@ -432,7 +447,9 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Fixed processing resolution** — both modalities are resized to 256×256. Small or distant fire regions may lose spatial detail. A multiscale inference approach could improve small-source detection.
 - **No temporal modeling** — frames are processed independently. A UAV video stream has strong temporal correlation that is currently unused.
 - **Flat-earth geolocation assumption** — the back-projection in `geolocate.py` assumes flat terrain at the drone's GPS altitude. Mountainous terrain requires DEM (Digital Elevation Model) intersection for accurate GPS projection.
-- **Geolocation not yet implemented** — `geolocate.py` is a fully specified stub. Normalized contour coordinates are structured and ready; implementation requires a MAVLink telemetry log and `pymavlink` / `pyproj`.
+- **No per-frame capture timestamps yet** — `geolocate.py`'s fire tracking and velocity estimates rely on `--fps`-based sequential timestamps rather than real capture times, since `infer.py`/`localize.py` don't currently record one. Fine for simulated telemetry; an approximation for real flights until upstream timestamp capture is added.
+- **Geolocation validated with simulated telemetry only** — `geolocate.py` is implemented and self-tested (`--self_test`) against known-correct nadir/off-nadir projections, but has not yet been validated against a real MAVLink flight log. Swap `--simulate_telemetry` for `--telemetry_log` once one is available.
+- **Fire tracking uses simple nearest-centroid matching** — adequate for a handful of fire regions per frame and easy to justify (explainable, consistent with the project's classical-CV design philosophy), but could misassociate tracks if two fire fronts cross paths within one frame interval. A Kalman filter or Hungarian-algorithm assignment would be a natural upgrade if that becomes an issue.
 
 ---
 
