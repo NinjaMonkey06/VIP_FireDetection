@@ -149,6 +149,26 @@ class TestGeolocateResults(GeolocateTest):
         self.assertTrue(any("takeoff" in w for w in data["results"][0]["geolocation"]["warnings"]))
 
 
+class TestImageSizeSource(GeolocateTest):
+    """The camera size check uses original_wh from the localization JSON (the size of
+    the thermal image localize.py read), never the 256x256 space or any overlay size."""
+
+    def project_with_wh(self, w, h):
+        reg = region(SQUARE)
+        reg["original_wh"] = {"width": w, "height": h}
+        geolocate.geolocate_region(reg, CAMERA, SidecarCsvLoader(self.csv).load("nadir"))
+        return reg
+
+    def test_plain_resize_of_calibrated_frame_gives_same_gps(self):
+        a, b = self.project_with_wh(640, 512), self.project_with_wh(1280, 1024)
+        self.assertEqual(a["gps_polygon"], b["gps_polygon"])
+        self.assertEqual(a["ground_area_m2"], b["ground_area_m2"])
+
+    def test_real_mismatch_still_rejected(self):
+        with self.assertRaisesRegex(ValueError, "958x760"):
+            self.project_with_wh(958, 760)
+
+
 class TestGeoJson(GeolocateTest):
     def test_lon_lat_order_and_closed_rings(self):
         gj = geolocate.to_geojson(self.data["results"])
