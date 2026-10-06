@@ -12,8 +12,8 @@ import numpy as np
 
 import geolocate
 from geoloc.camera import camera_config_from_dict
-from geoloc.metadata import SidecarCsvLoader
-from geoloc.projection import latlon_to_offset
+from geoloc.metadata import FrameMetadata, SidecarCsvLoader
+from geoloc.projection import ReliabilityLimits, latlon_to_offset
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE_JSON = os.path.join(REPO, "Sample Localization Output", "localization_results.json")
@@ -85,7 +85,8 @@ class GeolocateTest(unittest.TestCase):
 class TestGeolocateResults(GeolocateTest):
     def test_counts(self):
         self.assertEqual(self.counts, {"frames_geolocated": 3, "frames_missing_metadata": 1,
-                                       "regions_geolocated": 4, "regions_crossing_horizon": 1})
+                                       "regions_geolocated": 3, "regions_partially_unreliable": 1,
+                                       "regions_unreliable": 1})
 
     def test_centered_square_uses_original_resolution(self):
         # normalized 0.4..0.6 of 640x512 → ±64 px x ±51.2 px → ±20 m E x ±16 m N
@@ -123,15 +124,53 @@ class TestGeolocateResults(GeolocateTest):
         self.assertIsNone(r["fire_regions"][0]["gps_polygon"])
 
     def test_oblique_frame(self):
+        # Pitch -10°, fx = 320: TOP (rows 0..154) is entirely above the horizon. SQUARE's top
+        # edge (51.2 px above center → 9.1° above the axis) is ~1° below the horizon, i.e.
+        # ~6 km away and below the 10° default → unreliable; its bottom edge (~19° down) is fine.
         r = self.by_id["oblique"]
         top, center = r["fire_regions"]
-        self.assertEqual(top["geolocation_status"], "crosses_horizon")
-        self.assertIsNone(top["gps_polygon"])
-        self.assertEqual(center["geolocation_status"], "ok")
-        # center pixel at pitch -10° lands 100 / tan(10°) = 567 m north
-        n, e = latlon_to_offset(LAT0, LON0, center["gps_centroid"]["lat"], center["gps_centroid"]["lon"])
-        self.assertGreater(float(n), 400)
+        self.assertEqual(top["geolocation_status"], "unreliable")
+        self.assertEqual({v["unreliable"] for v in top["gps_polygon"]}, {"above_horizon"})
+        self.assertTrue(all(v["lat"] is None and v["ground_range_m"] is None for v in top["gps_polygon"]))
+
+        self.assertEqual(center["geolocation_status"], "partially_unreliable")
+        self.assertEqual([v.get("unreliable", "ok") for v in center["gps_polygon"]],
+                         ["below_min_depression", "below_min_depression", "ok", "ok"])
+        self.assertIsNone(center["gps_centroid"])
+        self.assertIsNone(center["ground_area_m2"])
+        for v in center["gps_polygon"]:
+            if "unreliable" in v:
+                self.assertIsNone(v["lat"])
+                self.assertLess(v["depression_deg"], 10.0)
+                self.assertGreater(v["ground_range_m"], 5000)
+            else:
+                self.assertIsNotNone(v["lat"])
+                self.assertGreater(v["depression_deg"], 18.0)
+                self.assertLess(v["ground_range_m"], 300)
         self.assertTrue(any("oblique" in w for w in r["geolocation"]["warnings"]))
+
+    def test_oblique_limits_are_configurable(self):
+        loader = SidecarCsvLoader(self.csv)
+        off = frame("oblique", [SQUARE])
+        geolocate.geolocate_results([off], CAMERA, loader, limits=ReliabilityLimits(None, None))
+        reg = off["fire_regions"][0]
+        self.assertEqual(reg["geolocation_status"], "ok")            # old behaviour: ~6 km polygon
+        self.assertGreater(max(v["ground_range_m"] for v in reg["gps_polygon"]), 5000)
+
+        capped = frame("oblique", [SQUARE])
+        geolocate.geolocate_results([capped], CAMERA, loader, limits=ReliabilityLimits(None, 250.0))
+        self.assertEqual({v["unreliable"] for v in capped["fire_regions"][0]["gps_polygon"]},
+                         {"beyond_max_range"})
+
+    def test_center_above_horizon_still_writes_strict_json(self):
+        class LevelCamera:   # gimbal pointing at the horizon
+            def load(self, frame_id, image_path=None):
+                return FrameMetadata(LAT0, LON0, 100.0, 0.0, 0.0, 0.0, None, "agl", "stub")
+        data = [frame("level", [SQUARE])]
+        geolocate.geolocate_results(data, CAMERA, LevelCamera(), merge_kernel_size=15)
+        self.assertIsNone(data[0]["geolocation"]["gsd_center_m"])
+        self.assertIsNone(data[0]["geolocation"]["dilation_buffer_m"])
+        json.dumps(data, allow_nan=False)   # raises if any NaN leaked into the output
 
     def test_frame_level_fields(self):
         g = self.by_id["nadir"]["geolocation"]
@@ -172,7 +211,7 @@ class TestImageSizeSource(GeolocateTest):
 class TestGeoJson(GeolocateTest):
     def test_lon_lat_order_and_closed_rings(self):
         gj = geolocate.to_geojson(self.data["results"])
-        self.assertEqual(len(gj["features"]), 4)
+        self.assertEqual(len(gj["features"]), 3)   # only fully reliable regions
         for feat in gj["features"]:
             ring = feat["geometry"]["coordinates"][0]
             self.assertEqual(ring[0], ring[-1])
@@ -240,9 +279,10 @@ class TestCli(unittest.TestCase):
                     with open(os.path.splitext(paths["out.json"])[0] + ext) as f:
                         out = json.load(f)
                     if fmt == "json":
-                        self.assertEqual(out["summary"]["geolocation"]["regions_geolocated"], 4)
+                        self.assertEqual(out["summary"]["geolocation"]["regions_geolocated"], 3)
+                        self.assertEqual(out["summary"]["geolocation"]["min_depression_deg"], 10.0)
                     else:
-                        self.assertEqual(len(out["features"]), 4)
+                        self.assertEqual(len(out["features"]), 3)
 
 
 if __name__ == "__main__":

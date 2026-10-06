@@ -15,6 +15,11 @@ Pipeline per region:
 Fills per region: gps_polygon, gps_centroid, ground_area_m2, touches_frame_edge,
 geolocation_status. fire_front_arc is left null (out of scope).
 
+Oblique views: a vertex whose ray is above the horizon, less than
+--min_depression_deg below it (default 10°), or farther than --max_range_m
+(default off) is marked unreliable — lat/lon null plus a reason — instead of
+being projected. Centroid and area are only reported when every vertex is reliable.
+
 Usage:
     python geolocate.py --localization_json localization_results.json \
                         --camera_config camera_configs/dji_mini4pro.json \
@@ -38,7 +43,8 @@ import numpy as np
 
 from geoloc.camera import load_camera_config
 from geoloc.metadata import ExifXmpLoader, MetadataError, SidecarCsvLoader
-from geoloc.projection import FLAT_TERRAIN, ground_sample_distance_m, project_contour
+from geoloc.projection import (FLAT_TERRAIN, VERTEX_OK, ReliabilityLimits,
+                               ground_sample_distance_m, project_contour)
 
 PROCESS_SIZE = 256   # must match localize.py (pixel_256 coordinate space)
 
@@ -49,34 +55,54 @@ def touches_frame_edge(region) -> bool:
                for p in region["pixel_256"])
 
 
-def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN) -> str:
-    """Fills the region's GPS fields in place; returns its geolocation_status."""
+def finite_or_none(x, digits):
+    return round(float(x), digits) if np.isfinite(x) else None
+
+
+def encode_vertex(latlon, ground_range_m, depression_deg, status):
+    vertex = {"lat": None, "lon": None,
+              "ground_range_m": finite_or_none(ground_range_m, 1),
+              "depression_deg": round(float(depression_deg), 2)}
+    if status == VERTEX_OK:
+        vertex["lat"], vertex["lon"] = round(float(latlon[0]), 8), round(float(latlon[1]), 8)
+    else:
+        vertex["unreliable"] = status   # above_horizon / below_min_depression / beyond_max_range
+    return vertex
+
+
+def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
+                     limits=ReliabilityLimits()) -> str:
+    """Fills the region's GPS fields in place; returns its geolocation_status:
+    'ok' (every vertex reliable), 'partially_unreliable' or 'unreliable'.
+    Unreliable vertices keep their slot in gps_polygon with lat/lon = null."""
     W, H = region["original_wh"]["width"], region["original_wh"]["height"]
     intr = camera.intrinsics_for(W, H)
     pts = np.array([[p["x"] * W, p["y"] * H] for p in region["normalized"]])
-    pc = project_contour(pts, intr, meta.pose(), meta.latitude_deg, meta.longitude_deg, terrain)
+    pc = project_contour(pts, intr, meta.pose(), meta.latitude_deg, meta.longitude_deg,
+                         terrain, limits)
 
-    region["touches_frame_edge"] = touches_frame_edge(region)
-    if pc.n_invalid:
-        region.update({"gps_polygon": None, "gps_centroid": None, "ground_area_m2": None,
-                       "geolocation_status": "crosses_horizon",
-                       "geolocation_note": f"{pc.n_invalid} vertices at/above the horizon"})
-        return "crosses_horizon"
-
+    n_bad = pc.n_unreliable
+    status = "ok" if n_bad == 0 else "unreliable" if n_bad == len(pts) else "partially_unreliable"
     region.update({
-        "gps_polygon":    [{"lat": round(float(lat), 8), "lon": round(float(lon), 8)} for lat, lon in pc.latlon],
-        "gps_centroid":   {"lat": round(pc.centroid_latlon[0], 8), "lon": round(pc.centroid_latlon[1], 8)},
-        "ground_area_m2": round(pc.area_m2, 2),
-        "geolocation_status": "ok",
+        "gps_polygon":    [encode_vertex(*v) for v in zip(pc.latlon, pc.ground_range_m,
+                                                           pc.depression_deg, pc.vertex_status)],
+        "gps_centroid":   None if pc.centroid_latlon is None else
+                          {"lat": round(pc.centroid_latlon[0], 8), "lon": round(pc.centroid_latlon[1], 8)},
+        "ground_area_m2": None if pc.area_m2 is None else round(pc.area_m2, 2),
+        "touches_frame_edge": touches_frame_edge(region),
+        "geolocation_status": status,
     })
-    return "ok"
+    if n_bad:
+        region["geolocation_note"] = (f"{n_bad}/{len(pts)} vertices unreliable "
+                                      f"(near/above horizon or out of range); no centroid/area")
+    return status
 
 
 def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size=0,
-                      terrain=FLAT_TERRAIN) -> dict:
+                      terrain=FLAT_TERRAIN, limits=ReliabilityLimits()) -> dict:
     """Geolocates every localized frame in place. Returns counts for the summary."""
-    counts = {"frames_geolocated": 0, "frames_missing_metadata": 0,
-              "regions_geolocated": 0, "regions_crossing_horizon": 0}
+    counts = {"frames_geolocated": 0, "frames_missing_metadata": 0, "regions_geolocated": 0,
+              "regions_partially_unreliable": 0, "regions_unreliable": 0}
 
     for result in results:
         regions = result.get("fire_regions") or []
@@ -114,17 +140,19 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
                       "gimbal_yaw_deg": meta.gimbal_yaw_deg,
                       "gimbal_pitch_deg": meta.gimbal_pitch_deg,
                       "gimbal_roll_deg": meta.gimbal_roll_deg},
-            "gsd_center_m": round(gsd, 4),
+            # None when the image center itself does not reach the ground.
+            "gsd_center_m": finite_or_none(gsd, 4),
             # localize.py dilates the mask by merge_kernel_size px at 256 scale, pushing
             # polygons outward by about half the kernel. Approximate, at the image center.
-            "dilation_buffer_m": round((merge_kernel_size // 2) * (W / PROCESS_SIZE) * gsd, 2),
+            "dilation_buffer_m": finite_or_none((merge_kernel_size // 2) * (W / PROCESS_SIZE) * gsd, 2),
             "warnings": warnings,
         }
 
-        statuses = [geolocate_region(region, camera, meta, terrain) for region in regions]
+        statuses = [geolocate_region(region, camera, meta, terrain, limits) for region in regions]
         counts["frames_geolocated"] += 1
         counts["regions_geolocated"] += statuses.count("ok")
-        counts["regions_crossing_horizon"] += statuses.count("crosses_horizon")
+        counts["regions_partially_unreliable"] += statuses.count("partially_unreliable")
+        counts["regions_unreliable"] += statuses.count("unreliable")
         print(f"  [✓] {result['frame_id']:<32} regions={len(regions)}  ok={statuses.count('ok')}"
               f"  gsd={gsd:.3f} m/px")
 
@@ -169,6 +197,12 @@ def main():
     source.add_argument("--exif_image_dir",    help="Folder of the original images to read EXIF/XMP from")
     parser.add_argument("--csv_altitude_reference", default="agl", choices=["agl", "takeoff", "msl"],
                         help="What the CSV altitude column is relative to (default: agl)")
+    parser.add_argument("--min_depression_deg", type=float, default=10.0,
+                        help="Vertices whose ray is less than this far below the horizon are marked "
+                             "unreliable (default: 10). Set a negative value to disable.")
+    parser.add_argument("--max_range_m",       type=float, default=None,
+                        help="Vertices farther than this from the drone's ground position are "
+                             "marked unreliable (default: off)")
     parser.add_argument("--output_json",       default="geolocated_results.json")
     parser.add_argument("--output_format",     default="json", choices=["json", "geojson"])
     args = parser.parse_args()
@@ -186,19 +220,27 @@ def main():
     merge_kernel_size = summary.get("parameters", {}).get("merge_kernel_size", 0)
 
     print(f"[✓] Camera: {camera.name}   Metadata: {args.metadata_csv or args.exif_image_dir}\n")
-    counts = geolocate_results(results, camera, loader, args.exif_image_dir, merge_kernel_size)
-    summary["geolocation"] = {**counts, "camera": camera.name, "terrain": "flat"}
+    limits = ReliabilityLimits(args.min_depression_deg if args.min_depression_deg >= 0 else None,
+                               args.max_range_m)
+    counts = geolocate_results(results, camera, loader, args.exif_image_dir, merge_kernel_size,
+                               limits=limits)
+    summary["geolocation"] = {**counts, "camera": camera.name, "terrain": "flat",
+                              "min_depression_deg": limits.min_depression_deg,
+                              "max_range_m": limits.max_range_m}
 
     base = os.path.splitext(args.output_json)[0]
     if args.output_format == "json":
         out_path = base + ".json"
-        with open(out_path, "w") as f: json.dump({"summary": summary, "results": results}, f, indent=2)
+        with open(out_path, "w") as f:
+            json.dump({"summary": summary, "results": results}, f, indent=2, allow_nan=False)
     else:
         out_path = base + ".geojson"
-        with open(out_path, "w") as f: json.dump(to_geojson(results), f, indent=2)
+        with open(out_path, "w") as f:
+            json.dump(to_geojson(results), f, indent=2, allow_nan=False)
 
     print(f"\n[✓] Frames geolocated={counts['frames_geolocated']}  missing metadata={counts['frames_missing_metadata']}"
-          f"  regions ok={counts['regions_geolocated']}  crossing horizon={counts['regions_crossing_horizon']}")
+          f"  regions ok={counts['regions_geolocated']}  partially unreliable={counts['regions_partially_unreliable']}"
+          f"  unreliable={counts['regions_unreliable']}")
     print(f"[✓] Saved: {out_path}  ({args.output_format})")
 
 

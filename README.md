@@ -293,6 +293,8 @@ python geolocate.py \
 | `--camera_config` | required | Camera JSON — see below |
 | `--metadata_csv` / `--exif_image_dir` | one required | Metadata source |
 | `--csv_altitude_reference` | `agl` | What the CSV altitude column is relative to: `agl` / `takeoff` / `msl` |
+| `--min_depression_deg` | `10` | Vertices whose ray is less than this many degrees below the horizon are marked unreliable. Negative = off |
+| `--max_range_m` | off | Vertices farther than this from the drone's ground position are marked unreliable |
 | `--output_json` | `geolocated_results.json` | Output path (extension follows `--output_format`) |
 | `--output_format` | `json` | `json` (full results) or `geojson` (one Polygon per region, `[lon, lat]` order) |
 
@@ -306,12 +308,23 @@ python geolocate.py \
 
 > **Note on this repo's sample frames:** the thermal images behind `Sample Localization Output/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
 
+**Oblique views and the horizon.** A ray depressed θ below the horizon from height h lands h / tan θ away, and an attitude error dθ moves it by h · dθ / sin²θ:
+
+| Depression | Ground range at 100 m AGL | Error per 1° attitude error |
+|---|---|---|
+| 30° | 173 m | 7 m |
+| 10° | 567 m | 58 m |
+| 5° | 1.1 km | 230 m |
+| 1° | 5.7 km | 5.7 km |
+
+Rays at or above the horizon never reach the ground; rays just below it land kilometres away with errors just as large. Such vertices are therefore marked unreliable rather than projected (default: less than 10° below the horizon). `docs/geolocation_worked_example.md` walks through one oblique projection by hand.
+
 **Swapping the metadata source.** Every loader implements one method, `load(frame_id, image_path) -> FrameMetadata` (`geoloc/metadata.py`). A telemetry-log loader only has to return the same `FrameMetadata`; `geolocate.py` and the math are unchanged.
 
 **What each region gets:**
-- `gps_polygon` — `[{lat, lon}, …]` for every contour vertex, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic)
-- `gps_centroid` — area-weighted centroid computed on the ground (for oblique views the image-space centroid is not the ground centroid)
-- `ground_area_m2`, `touches_frame_edge` (the fire continues outside the frame), `geolocation_status` (`ok` / `crosses_horizon` / `missing_metadata`)
+- `gps_polygon` — one entry per contour vertex, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic): `{lat, lon, ground_range_m, depression_deg}`. Unreliable vertices keep their slot with `lat`/`lon` = `null` and an `unreliable` reason (`above_horizon` / `below_min_depression` / `beyond_max_range`)
+- `gps_centroid` — area-weighted centroid computed on the ground (for oblique views the image-space centroid is not the ground centroid); `null` unless every vertex is reliable
+- `ground_area_m2` (same rule), `touches_frame_edge` (the fire continues outside the frame), `geolocation_status` (`ok` / `partially_unreliable` / `unreliable` / `missing_metadata`). GeoJSON output contains only `ok` regions
 - `fire_front_arc` stays `null` (out of scope)
 
 Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward by roughly this distance, so GPS outlines are larger than the burning area.

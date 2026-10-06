@@ -11,7 +11,8 @@ import unittest
 import numpy as np
 
 from geoloc.projection import (
-    EARTH_RADIUS_M, CameraPose, Intrinsics,
+    ABOVE_HORIZON, BELOW_MIN_DEPRESSION, BEYOND_MAX_RANGE, EARTH_RADIUS_M, VERTEX_OK,
+    CameraPose, Intrinsics, ReliabilityLimits,
     ground_sample_distance_m, ground_to_pixels, latlon_to_offset,
     normalized_to_pixels, offset_to_latlon, pixels_to_ground,
     pixels_to_normalized, polygon_area_centroid, project_contour,
@@ -211,7 +212,7 @@ class TestPolygons(unittest.TestCase):
                 self.assertAlmostEqual(res.area_m2, 400.0, places=6)     # 20 m x 20 m
                 self.assertAlmostEqual(res.centroid_latlon[0], LAT0, places=12)
                 self.assertAlmostEqual(res.centroid_latlon[1], LON0, places=12)
-                self.assertEqual(res.n_invalid, 0)
+                self.assertEqual(res.n_unreliable, 0)
 
     def test_area_centroid_not_vertex_mean(self):
         # Rectangle N 10..30, E 0..20 plus an extra collinear vertex on one edge:
@@ -232,7 +233,66 @@ class TestPolygons(unittest.TestCase):
     def test_polygon_crossing_horizon_has_no_area(self):
         res = project_contour(np.array([[400, 0], [600, 0], [600, 600], [400, 600]], dtype=float),
                               INTR, CameraPose(ALT, 0.0, -10.0), LAT0, LON0)
-        self.assertEqual(res.n_invalid, 2)
+        self.assertEqual(res.vertex_status, [ABOVE_HORIZON, ABOVE_HORIZON, VERTEX_OK, VERTEX_OK])
+        self.assertEqual(res.n_unreliable, 2)
+        self.assertIsNone(res.area_m2)
+        self.assertIsNone(res.centroid_latlon)
+        self.assertTrue(np.isnan(res.latlon[:2]).all())
+        self.assertFalse(np.isnan(res.latlon[2:]).any())       # reliable vertices still projected
+
+
+class TestReliability(unittest.TestCase):
+    """Vertices near/above the horizon are marked unreliable instead of projected."""
+    # Pitch -10°: a pixel 500·tan(8°) = 70.27 px above center looks 2° below the horizon.
+    NEAR_HORIZON = np.array([[500.0, 400.0 - 500.0 * math.tan(math.radians(8.0))]])
+    POSE = CameraPose(ALT, 0.0, -10.0)
+
+    def project(self, pts, pose=POSE, limits=ReliabilityLimits()):
+        return project_contour(np.asarray(pts, dtype=float), INTR, pose, LAT0, LON0, limits=limits)
+
+    def test_center_ray_depression_equals_minus_pitch(self):
+        for pitch in (-90.0, -60.0, -30.0, -5.0):
+            with self.subTest(pitch=pitch):
+                res = self.project([CENTER], CameraPose(ALT, 25.0, pitch))
+                self.assertAlmostEqual(res.depression_deg[0], -pitch, places=9)
+
+    def test_default_rejects_shallow_rays(self):
+        self.assertEqual(ReliabilityLimits().min_depression_deg, 10.0)
+        self.assertEqual(self.project([CENTER], CameraPose(ALT, 0.0, -30.0)).vertex_status, [VERTEX_OK])
+        self.assertEqual(self.project([CENTER], CameraPose(ALT, 0.0, -5.0)).vertex_status,
+                         [BELOW_MIN_DEPRESSION])
+
+    def test_near_horizon_vertex_is_not_projected(self):
+        res = self.project(self.NEAR_HORIZON)
+        self.assertAlmostEqual(res.depression_deg[0], 2.0, places=9)
+        self.assertEqual(res.vertex_status, [BELOW_MIN_DEPRESSION])
+        self.assertTrue(np.isnan(res.latlon).all())
+        # The raw hit is still reported for diagnostics: 100 / tan(2°) = 2863.6 m away.
+        self.assertAlmostEqual(res.ground_range_m[0], 100.0 / math.tan(math.radians(2.0)), places=6)
+
+    def test_limits_disabled_projects_far_away(self):
+        res = self.project(self.NEAR_HORIZON, limits=ReliabilityLimits(None, None))
+        self.assertEqual(res.vertex_status, [VERTEX_OK])
+        n, _ = latlon_to_offset(LAT0, LON0, res.latlon[0, 0], res.latlon[0, 1])
+        self.assertAlmostEqual(float(n), 2863.6, delta=0.1)
+
+    def test_max_range(self):
+        limits = ReliabilityLimits(None, 1000.0)
+        self.assertEqual(self.project(self.NEAR_HORIZON, limits=limits).vertex_status, [BEYOND_MAX_RANGE])
+        # Center ray at pitch -30° lands 173 m away: within range.
+        self.assertEqual(self.project([CENTER], CameraPose(ALT, 0.0, -30.0), limits).vertex_status,
+                         [VERTEX_OK])
+
+    def test_above_horizon_flagged_even_with_limits_disabled(self):
+        res = self.project([[500.0, 0.0]], limits=ReliabilityLimits(None, None))
+        self.assertEqual(res.vertex_status, [ABOVE_HORIZON])
+        self.assertTrue(np.isnan(res.ground_range_m).all())
+        self.assertLess(res.depression_deg[0], 0.0)
+
+    def test_one_shallow_vertex_drops_area_and_centroid(self):
+        pts = np.vstack(([[450, 450], [550, 450], [550, 550]], self.NEAR_HORIZON))
+        res = self.project(pts)
+        self.assertEqual(res.vertex_status, [VERTEX_OK] * 3 + [BELOW_MIN_DEPRESSION])
         self.assertIsNone(res.area_m2)
         self.assertIsNone(res.centroid_latlon)
 

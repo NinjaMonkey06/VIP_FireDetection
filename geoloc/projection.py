@@ -16,6 +16,8 @@ Differences from the reference:
     - General ray casting: any gimbal pitch, not only straight down. At
       pitch = -90° and roll = 0 it reduces exactly to the reference nadir math.
     - Ground intersection is behind a Terrain interface (flat ground for now).
+    - Vertices at, above or near the horizon are marked unreliable instead of
+      being projected to huge, attitude-sensitive distances (ReliabilityLimits).
 
 Frames:
     camera  x right, y down, z along the optical axis (OpenCV convention)
@@ -27,7 +29,7 @@ Frames:
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Protocol, Tuple
+from typing import List, Optional, Protocol, Tuple
 
 import cv2
 import numpy as np
@@ -209,26 +211,85 @@ def polygon_area_centroid(north_east: np.ndarray) -> Tuple[float, Tuple[float, f
     return float(abs(signed_area)), (float(cn), float(ce))
 
 
+# ==================== Reliability near the horizon ====================
+VERTEX_OK = "ok"
+ABOVE_HORIZON = "above_horizon"              # ray never reaches the ground
+BELOW_MIN_DEPRESSION = "below_min_depression"
+BEYOND_MAX_RANGE = "beyond_max_range"
+
+
+@dataclass(frozen=True)
+class ReliabilityLimits:
+    """When a vertex counts as too far / too shallow to project.
+
+    A ray depressed θ below the horizon from height h lands h / tan θ away, and an
+    attitude error dθ moves it by h · dθ / sin²θ. At h = 100 m that is 58 m per
+    degree of error at θ = 10°, 230 m at 5° and 5.7 km at 1°, so shallow rays are
+    marked unreliable instead of projected. None disables a limit."""
+    min_depression_deg: Optional[float] = 10.0
+    max_range_m: Optional[float] = None
+
+
+def depression_deg(rays_ned: np.ndarray) -> np.ndarray:
+    """Angle of each NED ray below the horizontal plane (negative above it)."""
+    rays = np.asarray(rays_ned, dtype=np.float64).reshape(-1, 3)
+    return np.degrees(np.arctan2(rays[:, 2], np.hypot(rays[:, 0], rays[:, 1])))
+
+
 @dataclass
 class ProjectedContour:
-    latlon: np.ndarray                       # (N, 2) [lat, lon]; NaN rows for invalid vertices
-    north_east: np.ndarray                   # (N, 2) meters from the drone's ground position
-    n_invalid: int                           # vertices at/above the horizon
-    area_m2: Optional[float]                 # None if any vertex is invalid
+    latlon: np.ndarray                       # (N, 2) [lat, lon]; NaN rows unless vertex_status is "ok"
+    north_east: np.ndarray                   # (N, 2) raw ground hit; NaN only above the horizon
+    ground_range_m: np.ndarray               # (N,) horizontal distance from the drone's ground position
+    depression_deg: np.ndarray               # (N,) ray angle below the horizon
+    vertex_status: List[str]                 # VERTEX_OK or the reason the vertex is unreliable
+    area_m2: Optional[float]                 # None unless every vertex is ok
     centroid_latlon: Optional[Tuple[float, float]]
+
+    @property
+    def n_unreliable(self) -> int:
+        return sum(s != VERTEX_OK for s in self.vertex_status)
+
+
+def classify_vertices(ground_range_m: np.ndarray, depression: np.ndarray,
+                      limits: ReliabilityLimits) -> List[str]:
+    status = []
+    for rng, dep in zip(ground_range_m, depression):
+        if np.isnan(rng):
+            status.append(ABOVE_HORIZON)
+        elif limits.min_depression_deg is not None and dep < limits.min_depression_deg:
+            status.append(BELOW_MIN_DEPRESSION)
+        elif limits.max_range_m is not None and rng > limits.max_range_m:
+            status.append(BEYOND_MAX_RANGE)
+        else:
+            status.append(VERTEX_OK)
+    return status
 
 
 def project_contour(points_px: np.ndarray, intr: Intrinsics, pose: CameraPose,
                     lat0: float, lon0: float,
-                    terrain: Terrain = FLAT_TERRAIN) -> ProjectedContour:
-    """Project every contour vertex to the ground; centroid/area computed in ground
-    meters (the image-space centroid is not the ground centroid for oblique views)."""
-    ne = pixels_to_ground(points_px, intr, pose, terrain)
-    invalid = np.isnan(ne).any(axis=1)
+                    terrain: Terrain = FLAT_TERRAIN,
+                    limits: ReliabilityLimits = ReliabilityLimits()) -> ProjectedContour:
+    """Project every contour vertex to the ground. Vertices above the horizon or
+    outside `limits` get NaN lat/lon and a reason in vertex_status. Centroid/area
+    are computed in ground meters (the image-space centroid is not the ground
+    centroid for oblique views), and only when every vertex is reliable."""
+    if pose.altitude_agl_m <= 0:
+        raise ValueError(f"altitude_agl_m must be positive, got {pose.altitude_agl_m}")
+    rays = pixels_to_rays_ned(points_px, intr, pose)
+    ne = terrain.intersect(pose.altitude_agl_m, rays)
+    ground_range = np.hypot(ne[:, 0], ne[:, 1])
+    depression = depression_deg(rays)
+    status = classify_vertices(ground_range, depression, limits)
+
+    ok = np.array([s == VERTEX_OK for s in status], dtype=bool)
     lat, lon = offset_to_latlon(lat0, lon0, ne[:, 0], ne[:, 1])
     latlon = np.column_stack((lat, lon))
-    if invalid.any() or len(ne) < 3:
-        return ProjectedContour(latlon, ne, int(invalid.sum()), None, None)
-    area, (cn, ce) = polygon_area_centroid(ne)
-    clat, clon = offset_to_latlon(lat0, lon0, cn, ce)
-    return ProjectedContour(latlon, ne, 0, area, (float(clat), float(clon)))
+    latlon[~ok] = np.nan
+
+    area = centroid = None
+    if ok.all() and len(ne) >= 3:
+        area, (cn, ce) = polygon_area_centroid(ne)
+        clat, clon = offset_to_latlon(lat0, lon0, cn, ce)
+        centroid = (float(clat), float(clon))
+    return ProjectedContour(latlon, ne, ground_range, depression, status, area, centroid)
