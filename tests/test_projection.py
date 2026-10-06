@@ -12,7 +12,7 @@ import numpy as np
 
 from geoloc.projection import (
     ABOVE_HORIZON, BELOW_MIN_DEPRESSION, BEYOND_MAX_RANGE, EARTH_RADIUS_M, VERTEX_OK,
-    CameraPose, Intrinsics, ReliabilityLimits,
+    CameraPose, Intrinsics, ReliabilityLimits, camera_to_ned, clip_polygon_disk, polygon_area,
     ground_sample_distance_m, ground_to_pixels, latlon_to_offset,
     normalized_to_pixels, offset_to_latlon, pixels_to_ground,
     pixels_to_normalized, polygon_area_centroid, project_contour,
@@ -230,15 +230,17 @@ class TestPolygons(unittest.TestCase):
         self.assertAlmostEqual(cn, 10.0)
         self.assertAlmostEqual(ce, 10.0)
 
-    def test_polygon_crossing_horizon_has_no_area(self):
+    def test_polygon_crossing_horizon_is_clipped(self):
         res = project_contour(np.array([[400, 0], [600, 0], [600, 600], [400, 600]], dtype=float),
                               INTR, CameraPose(ALT, 0.0, -10.0), LAT0, LON0)
         self.assertEqual(res.vertex_status, [ABOVE_HORIZON, ABOVE_HORIZON, VERTEX_OK, VERTEX_OK])
         self.assertEqual(res.n_unreliable, 2)
-        self.assertIsNone(res.area_m2)
-        self.assertIsNone(res.centroid_latlon)
         self.assertTrue(np.isnan(res.latlon[:2]).all())
         self.assertFalse(np.isnan(res.latlon[2:]).any())       # reliable vertices still projected
+        self.assertTrue(res.clipped)
+        self.assertGreater(res.area_m2, 0.0)
+        radius = 100.0 / math.tan(math.radians(10.0))
+        self.assertLessEqual(np.hypot(*res.polygon_north_east.T).max(), radius + 1e-6)
 
 
 class TestReliability(unittest.TestCase):
@@ -289,12 +291,110 @@ class TestReliability(unittest.TestCase):
         self.assertTrue(np.isnan(res.ground_range_m).all())
         self.assertLess(res.depression_deg[0], 0.0)
 
-    def test_one_shallow_vertex_drops_area_and_centroid(self):
+    def test_one_shallow_vertex_clips_instead_of_dropping(self):
         pts = np.vstack(([[450, 450], [550, 450], [550, 550]], self.NEAR_HORIZON))
         res = self.project(pts)
         self.assertEqual(res.vertex_status, [VERTEX_OK] * 3 + [BELOW_MIN_DEPRESSION])
+        self.assertTrue(res.clipped)
+        self.assertIsNotNone(res.centroid_latlon)
+        # The three reliable vertices survive unchanged; the rest of the outline is new.
+        self.assertEqual(res.polygon_clip_vertex.count(False), 3)
+        dep = np.degrees(np.arctan2(ALT, np.hypot(*res.polygon_north_east.T)))
+        self.assertGreaterEqual(dep.min(), 10.0 - 1e-6)
+
+
+def half_disk_image_polygon(intr, pose, width_m, top_v):
+    """Image polygon whose below-horizon part is exactly the ground strip
+    {forward >= 0, |sideways| <= width_m} relative to the drone, for a camera that
+    sees both its nadir point and the horizon. Its sides are the images of the
+    strip's two long edges, continued past their vanishing point into the sky."""
+    psi = math.radians(pose.yaw_deg)
+    fwd, side = np.array([math.cos(psi), math.sin(psi)]), np.array([-math.sin(psi), math.cos(psi)])
+    bottom = ground_to_pixels(np.array([-width_m * side, width_m * side]), intr, pose)
+    d_cam = camera_to_ned(pose).T @ np.array([fwd[0], fwd[1], 0.0])
+    vp = np.array([intr.fx * d_cam[0] / d_cam[2] + intr.cx, intr.fy * d_cam[1] / d_cam[2] + intr.cy])
+    top = [b + (vp - b) * (top_v - b[1]) / (vp[1] - b[1]) for b in bottom]
+    return np.array([bottom[0], bottom[1], top[1], top[0]]), fwd
+
+
+class TestClipping(unittest.TestCase):
+    """Regions with unreliable vertices are clipped to their reliable part
+    (on flat ground: a disk of radius h / tan(min_depression) around the drone)."""
+
+    def test_fully_reliable_region_is_unchanged(self):
+        sq = np.array([[450, 350], [550, 350], [550, 450], [450, 450]], dtype=float)
+        res = project_contour(sq, INTR, CameraPose(ALT, 20.0), LAT0, LON0)
+        self.assertFalse(res.clipped)
+        self.assertEqual(res.removed_area_fraction, 0.0)
+        np.testing.assert_array_equal(res.polygon_north_east, res.north_east)
+        np.testing.assert_array_equal(res.polygon_latlon, res.latlon)
+        self.assertEqual(res.polygon_clip_vertex, [False] * 4)
+        self.assertAlmostEqual(res.area_m2, 400.0, places=6)
+
+    def test_half_reliable_nadir_region_gives_half_disk(self):
+        # Nadir, 1 m = 5 px. Limit chosen so the reliable disk has radius 30 m.
+        # Ground rectangle N 0..60, E -60..60 -> clipped part is the half disk N >= 0.
+        limits = ReliabilityLimits(min_depression_deg=math.degrees(math.atan2(100.0, 30.0)))
+        rect = np.array([[200, 400], [800, 400], [800, 100], [200, 100]], dtype=float)
+        res = project_contour(rect, INTR, CameraPose(ALT, 0.0), LAT0, LON0, limits=limits)
+        self.assertEqual(res.vertex_status, [BELOW_MIN_DEPRESSION] * 4)   # every vertex is too far,
+        self.assertTrue(res.clipped)                                       # but part is reliable
+        half_disk = math.pi * 30.0 ** 2 / 2                                # 1413.7 m²
+        self.assertAlmostEqual(res.area_m2 / half_disk, 1.0, delta=1e-3)
+        n, e = latlon_to_offset(LAT0, LON0, *res.centroid_latlon)
+        self.assertAlmostEqual(float(n), 4 * 30.0 / (3 * math.pi), delta=0.01)   # 12.73 m
+        self.assertAlmostEqual(float(e), 0.0, delta=0.01)
+        # Nadir view: image area is proportional to ground area, so removed = 1 - 1413.7 / 7200.
+        self.assertAlmostEqual(res.removed_area_fraction, 1 - half_disk / 7200.0, delta=1e-3)
+        self.assertTrue(all(res.polygon_clip_vertex))
+
+    def test_half_above_horizon_oblique_region_gives_half_disk(self):
+        # Wide camera (vertical FOV 127°) at pitch -45° sees its own nadir point and the sky.
+        # The polygon runs from the ground line through the nadir point up past the horizon.
+        wide = Intrinsics(1000, 800, 200.0, 200.0, 500.0, 400.0)
+        radius = 100.0 / math.tan(math.radians(20.0))                      # 274.7 m
+        limits = ReliabilityLimits(min_depression_deg=20.0)
+        for yaw in (0.0, 30.0, -120.0):
+            with self.subTest(yaw=yaw):
+                pose = CameraPose(ALT, yaw, -45.0)
+                poly, fwd = half_disk_image_polygon(wide, pose, 600.0, top_v=50.0)
+                res = project_contour(poly, wide, pose, LAT0, LON0, limits=limits)
+                self.assertEqual(res.vertex_status,
+                                 [BELOW_MIN_DEPRESSION] * 2 + [ABOVE_HORIZON] * 2)
+                self.assertTrue(res.clipped)
+                self.assertAlmostEqual(res.area_m2 / (math.pi * radius ** 2 / 2), 1.0, delta=1e-3)
+                n, e = latlon_to_offset(LAT0, LON0, *res.centroid_latlon)
+                c = 4 * radius / (3 * math.pi)                             # 116.6 m along the yaw
+                np.testing.assert_allclose([float(n), float(e)], c * fwd, atol=0.2)
+                self.assertGreater(res.removed_area_fraction, 0.0)
+                self.assertLess(res.removed_area_fraction, 1.0)
+
+    def test_region_with_no_reliable_part_is_unreliable(self):
+        pose = CameraPose(ALT, 0.0, -10.0)
+        above = np.array([[400, 20], [600, 20], [600, 100], [400, 100]], dtype=float)
+        # Rows 330..340 are about 2-2.5° below the horizon: below the 10° minimum.
+        shallow = np.array([[450, 330], [550, 330], [550, 340], [450, 340]], dtype=float)
+        for name, pts in (("above_horizon", above), ("too_shallow", shallow)):
+            with self.subTest(name):
+                res = project_contour(pts, INTR, pose, LAT0, LON0)
+                self.assertEqual(res.n_unreliable, 4)
+                self.assertIsNone(res.polygon_north_east)
+                self.assertIsNone(res.area_m2)
+                self.assertIsNone(res.centroid_latlon)
+                self.assertEqual(res.removed_area_fraction, 1.0)
+
+    def test_no_limits_and_crossing_horizon_cannot_be_bounded(self):
+        res = project_contour(np.array([[400, 0], [600, 0], [600, 600], [400, 600]], dtype=float),
+                              INTR, CameraPose(ALT, 0.0, -10.0), LAT0, LON0,
+                              limits=ReliabilityLimits(None, None))
         self.assertIsNone(res.area_m2)
-        self.assertIsNone(res.centroid_latlon)
+
+    def test_clip_polygon_disk_square_inside_and_around(self):
+        sq = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], dtype=float)
+        self.assertAlmostEqual(polygon_area(clip_polygon_disk(sq, 10.0)), 4.0, places=9)
+        self.assertAlmostEqual(polygon_area(clip_polygon_disk(sq * 100, 10.0)) / (math.pi * 100), 1.0,
+                               delta=1e-4)
+        self.assertEqual(len(clip_polygon_disk(sq + 50, 10.0)), 0)
 
 
 class TestTerrainInterface(unittest.TestCase):

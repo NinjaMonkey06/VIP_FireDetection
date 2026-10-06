@@ -236,14 +236,74 @@ def depression_deg(rays_ned: np.ndarray) -> np.ndarray:
     return np.degrees(np.arctan2(rays[:, 2], np.hypot(rays[:, 0], rays[:, 1])))
 
 
+def reliable_radius_m(altitude_agl_m: float, limits: ReliabilityLimits) -> Optional[float]:
+    """On flat ground, "depression >= min" and "range <= max" are both a disk around the
+    drone's ground position. Returns the radius of their intersection (None if unbounded)."""
+    radii = []
+    if limits.min_depression_deg is not None and limits.min_depression_deg > 0:
+        radii.append(altitude_agl_m / math.tan(math.radians(limits.min_depression_deg)))
+    if limits.max_range_m is not None:
+        radii.append(limits.max_range_m)
+    return min(radii) if radii else None
+
+
+# ==================== Polygon clipping ====================
+DISK_SIDES = 360   # inscribed 360-gon: relative area error ~5e-5
+
+
+def clip_polygon_halfplane(pts: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
+    """Sutherland–Hodgman: keep the part of the polygon where a·x + b·y + c >= 0."""
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    out = []
+    for i in range(len(pts)):
+        p, q = pts[i], pts[(i + 1) % len(pts)]
+        fp, fq = a * p[0] + b * p[1] + c, a * q[0] + b * q[1] + c
+        if fp >= 0:
+            out.append(p)
+        if (fp >= 0) != (fq >= 0):
+            out.append(p + (q - p) * (fp / (fp - fq)))
+    return np.array(out).reshape(-1, 2)
+
+
+def clip_polygon_disk(pts: np.ndarray, radius: float, sides: int = DISK_SIDES) -> np.ndarray:
+    """Clip a polygon (any winding, may be concave) to a disk centred on the origin,
+    approximated by an inscribed regular polygon. A concave polygon whose clipped
+    part is disconnected comes back joined by zero-area bridges, so its area and
+    centroid stay correct."""
+    angles = np.linspace(0.0, 2.0 * math.pi, sides, endpoint=False)
+    disk = radius * np.column_stack((np.cos(angles), np.sin(angles)))     # counter-clockwise
+    out = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    for i in range(sides):
+        if len(out) == 0:
+            break
+        p, q = disk[i], disk[(i + 1) % sides]
+        a, b = -(q[1] - p[1]), q[0] - p[0]                                 # inside = left of p→q
+        out = clip_polygon_halfplane(out, a, b, -(a * p[0] + b * p[1]))
+    return out
+
+
+def polygon_area(pts: np.ndarray) -> float:
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    x, y = pts[:, 0], pts[:, 1]
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(np.roll(x, -1), y)))
+
+
+# ==================== Contours ====================
 @dataclass
 class ProjectedContour:
+    # Per ORIGINAL vertex (diagnostics):
     latlon: np.ndarray                       # (N, 2) [lat, lon]; NaN rows unless vertex_status is "ok"
     north_east: np.ndarray                   # (N, 2) raw ground hit; NaN only above the horizon
     ground_range_m: np.ndarray               # (N,) horizontal distance from the drone's ground position
     depression_deg: np.ndarray               # (N,) ray angle below the horizon
     vertex_status: List[str]                 # VERTEX_OK or the reason the vertex is unreliable
-    area_m2: Optional[float]                 # None unless every vertex is ok
+    # The reliable polygon (the original if every vertex is ok, else clipped); None if empty:
+    polygon_north_east: Optional[np.ndarray]
+    polygon_latlon: Optional[np.ndarray]
+    polygon_clip_vertex: List[bool]          # True for vertices created by clipping
+    clipped: bool
+    removed_area_fraction: float             # of the original polygon, measured in image pixels
+    area_m2: Optional[float]
     centroid_latlon: Optional[Tuple[float, float]]
 
     @property
@@ -266,16 +326,44 @@ def classify_vertices(ground_range_m: np.ndarray, depression: np.ndarray,
     return status
 
 
+def clip_to_reliable(points_px: np.ndarray, intr: Intrinsics, pose: CameraPose,
+                     radius_m: float) -> np.ndarray:
+    """Ground polygon (N, 2) of the part of an image polygon whose rays reach flat
+    ground within radius_m of the drone's ground position, i.e. whose depression and
+    range are within limits. Empty array if there is no such part.
+
+    1. In undistorted image coordinates the ray's down component is linear,
+       g(x, y) = R[2] · (x, y, 1), so "below the horizon" is a half-plane. Every
+       reliable ray has g >= sin(atan(h / radius)), so clipping at half that value
+       drops everything at, above or grazing the horizon without touching the
+       reliable part.
+    2. The rest maps to finite ground points, and straight image edges stay straight
+       on flat ground (homography), so the polygon is mapped vertex by vertex.
+    3. Clip to the disk of reliable range."""
+    h = pose.altitude_agl_m
+    xy = pixels_to_normalized(points_px, intr)
+    R = camera_to_ned(pose)
+    eps = 0.5 * math.sin(math.atan2(h, radius_m))
+    xy = clip_polygon_halfplane(xy, R[2, 0], R[2, 1], R[2, 2] - eps)
+    if len(xy) < 3:
+        return np.empty((0, 2))
+    rays = np.column_stack((xy, np.ones(len(xy)))) @ R.T
+    ground = FLAT_TERRAIN.intersect(h, rays)
+    return clip_polygon_disk(ground, radius_m)
+
+
 def project_contour(points_px: np.ndarray, intr: Intrinsics, pose: CameraPose,
                     lat0: float, lon0: float,
                     terrain: Terrain = FLAT_TERRAIN,
                     limits: ReliabilityLimits = ReliabilityLimits()) -> ProjectedContour:
-    """Project every contour vertex to the ground. Vertices above the horizon or
-    outside `limits` get NaN lat/lon and a reason in vertex_status. Centroid/area
-    are computed in ground meters (the image-space centroid is not the ground
-    centroid for oblique views), and only when every vertex is reliable."""
+    """Project a contour to the ground. If every vertex is reliable the polygon is used
+    as is. Otherwise it is clipped to its reliable part (rays at least
+    limits.min_depression_deg below the horizon and within limits.max_range_m), and
+    centroid/area come from the clipped polygon. Centroid/area are computed in ground
+    meters (the image-space centroid is not the ground centroid for oblique views)."""
     if pose.altitude_agl_m <= 0:
         raise ValueError(f"altitude_agl_m must be positive, got {pose.altitude_agl_m}")
+    points_px = np.asarray(points_px, dtype=np.float64).reshape(-1, 2)
     rays = pixels_to_rays_ned(points_px, intr, pose)
     ne = terrain.intersect(pose.altitude_agl_m, rays)
     ground_range = np.hypot(ne[:, 0], ne[:, 1])
@@ -286,10 +374,34 @@ def project_contour(points_px: np.ndarray, intr: Intrinsics, pose: CameraPose,
     lat, lon = offset_to_latlon(lat0, lon0, ne[:, 0], ne[:, 1])
     latlon = np.column_stack((lat, lon))
     latlon[~ok] = np.nan
+    diagnostics = (latlon, ne, ground_range, depression, status)
 
-    area = centroid = None
-    if ok.all() and len(ne) >= 3:
-        area, (cn, ce) = polygon_area_centroid(ne)
-        clat, clon = offset_to_latlon(lat0, lon0, cn, ce)
-        centroid = (float(clat), float(clon))
-    return ProjectedContour(latlon, ne, ground_range, depression, status, area, centroid)
+    if ok.all():
+        polygon, clip_vertex, clipped, removed = ne, [False] * len(ne), False, 0.0
+    else:
+        radius = reliable_radius_m(pose.altitude_agl_m, limits)
+        if radius is None:      # no limits: the part below the horizon is unbounded
+            polygon = np.empty((0, 2))
+        else:
+            if not isinstance(terrain, FlatTerrain):
+                raise NotImplementedError("clipping to the reliable part assumes flat terrain")
+            polygon = clip_to_reliable(points_px, intr, pose, radius)
+        if len(polygon) < 3 or polygon_area(polygon) < 1e-6:
+            return ProjectedContour(*diagnostics, None, None, [], True, 1.0, None, None)
+        # Vertices matching an original reliable vertex are kept; the rest were made by clipping.
+        originals = ne[ok]
+        clip_vertex = [not (len(originals) > 0 and np.hypot(*(originals - v).T).min() < 1e-6)
+                       for v in polygon]
+        clipped = True
+        # The removed part's ground area is unbounded or unreliable by definition, so the
+        # removed fraction is measured in image pixels.
+        kept_px = ground_to_pixels(polygon, intr, pose)
+        removed = max(0.0, 1.0 - polygon_area(kept_px) / polygon_area(points_px))
+
+    if len(polygon) < 3:
+        return ProjectedContour(*diagnostics, None, None, [], clipped, removed, None, None)
+    area, (cn, ce) = polygon_area_centroid(polygon)
+    plat, plon = offset_to_latlon(lat0, lon0, polygon[:, 0], polygon[:, 1])
+    clat, clon = offset_to_latlon(lat0, lon0, cn, ce)
+    return ProjectedContour(*diagnostics, polygon, np.column_stack((plat, plon)), clip_vertex,
+                            clipped, removed, area, (float(clat), float(clon)))

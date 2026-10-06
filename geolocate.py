@@ -15,10 +15,14 @@ Pipeline per region:
 Fills per region: gps_polygon, gps_centroid, ground_area_m2, touches_frame_edge,
 geolocation_status. fire_front_arc is left null (out of scope).
 
-Oblique views: a vertex whose ray is above the horizon, less than
---min_depression_deg below it (default 10°), or farther than --max_range_m
-(default off) is marked unreliable — lat/lon null plus a reason — instead of
-being projected. Centroid and area are only reported when every vertex is reliable.
+Oblique views: a ray above the horizon, less than --min_depression_deg below it
+(default 10°), or landing farther than --max_range_m (default off) is unreliable.
+A region with unreliable vertices is clipped to its reliable part (on flat ground,
+a disk around the drone), and centroid/area come from the clipped polygon:
+    ok                   every vertex reliable, polygon unchanged
+    clipped_to_reliable  polygon clipped; removed_area_fraction says how much
+                         (measured in image pixels: the removed ground area is unbounded)
+    unreliable           no reliable part at all
 
 Usage:
     python geolocate.py --localization_json localization_results.json \
@@ -43,8 +47,8 @@ import numpy as np
 
 from geoloc.camera import load_camera_config
 from geoloc.metadata import ExifXmpLoader, MetadataError, SidecarCsvLoader
-from geoloc.projection import (FLAT_TERRAIN, VERTEX_OK, ReliabilityLimits,
-                               ground_sample_distance_m, project_contour)
+from geoloc.projection import (FLAT_TERRAIN, ReliabilityLimits, ground_sample_distance_m,
+                               project_contour)
 
 PROCESS_SIZE = 256   # must match localize.py (pixel_256 coordinate space)
 
@@ -59,42 +63,49 @@ def finite_or_none(x, digits):
     return round(float(x), digits) if np.isfinite(x) else None
 
 
-def encode_vertex(latlon, ground_range_m, depression_deg, status):
-    vertex = {"lat": None, "lon": None,
-              "ground_range_m": finite_or_none(ground_range_m, 1),
-              "depression_deg": round(float(depression_deg), 2)}
-    if status == VERTEX_OK:
-        vertex["lat"], vertex["lon"] = round(float(latlon[0]), 8), round(float(latlon[1]), 8)
-    else:
-        vertex["unreliable"] = status   # above_horizon / below_min_depression / beyond_max_range
+def encode_vertex(lat, lon, north_east, is_clip_vertex, altitude_m):
+    ground_range = float(np.hypot(*north_east))
+    vertex = {"lat": round(float(lat), 8), "lon": round(float(lon), 8),
+              "ground_range_m": round(ground_range, 1),
+              "depression_deg": round(float(np.degrees(np.arctan2(altitude_m, ground_range))), 2)}
+    if is_clip_vertex:
+        vertex["clip_vertex"] = True    # created by clipping, not a fire-contour vertex
     return vertex
 
 
 def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
                      limits=ReliabilityLimits()) -> str:
     """Fills the region's GPS fields in place; returns its geolocation_status:
-    'ok' (every vertex reliable), 'partially_unreliable' or 'unreliable'.
-    Unreliable vertices keep their slot in gps_polygon with lat/lon = null."""
+    'ok', 'clipped_to_reliable' or 'unreliable' (no reliable part)."""
     W, H = region["original_wh"]["width"], region["original_wh"]["height"]
     intr = camera.intrinsics_for(W, H)
     pts = np.array([[p["x"] * W, p["y"] * H] for p in region["normalized"]])
     pc = project_contour(pts, intr, meta.pose(), meta.latitude_deg, meta.longitude_deg,
                          terrain, limits)
 
-    n_bad = pc.n_unreliable
-    status = "ok" if n_bad == 0 else "unreliable" if n_bad == len(pts) else "partially_unreliable"
+    if pc.polygon_north_east is None:
+        status = "unreliable"
+    else:
+        status = "clipped_to_reliable" if pc.clipped else "ok"
+    reasons = {}
+    for s in pc.vertex_status:
+        if s != "ok":
+            reasons[s] = reasons.get(s, 0) + 1
+
     region.update({
-        "gps_polygon":    [encode_vertex(*v) for v in zip(pc.latlon, pc.ground_range_m,
-                                                           pc.depression_deg, pc.vertex_status)],
+        "gps_polygon":    None if pc.polygon_north_east is None else
+                          [encode_vertex(lat, lon, ne, clip, meta.altitude_agl_m)
+                           for (lat, lon), ne, clip in zip(pc.polygon_latlon, pc.polygon_north_east,
+                                                           pc.polygon_clip_vertex)],
         "gps_centroid":   None if pc.centroid_latlon is None else
                           {"lat": round(pc.centroid_latlon[0], 8), "lon": round(pc.centroid_latlon[1], 8)},
         "ground_area_m2": None if pc.area_m2 is None else round(pc.area_m2, 2),
+        "clipped":        pc.clipped,
+        "removed_area_fraction": round(pc.removed_area_fraction, 4),
+        "unreliable_vertices": reasons,     # original contour vertices, by reason
         "touches_frame_edge": touches_frame_edge(region),
         "geolocation_status": status,
     })
-    if n_bad:
-        region["geolocation_note"] = (f"{n_bad}/{len(pts)} vertices unreliable "
-                                      f"(near/above horizon or out of range); no centroid/area")
     return status
 
 
@@ -102,7 +113,7 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
                       terrain=FLAT_TERRAIN, limits=ReliabilityLimits()) -> dict:
     """Geolocates every localized frame in place. Returns counts for the summary."""
     counts = {"frames_geolocated": 0, "frames_missing_metadata": 0, "regions_geolocated": 0,
-              "regions_partially_unreliable": 0, "regions_unreliable": 0}
+              "regions_clipped_to_reliable": 0, "regions_unreliable": 0}
 
     for result in results:
         regions = result.get("fire_regions") or []
@@ -151,20 +162,22 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
         statuses = [geolocate_region(region, camera, meta, terrain, limits) for region in regions]
         counts["frames_geolocated"] += 1
         counts["regions_geolocated"] += statuses.count("ok")
-        counts["regions_partially_unreliable"] += statuses.count("partially_unreliable")
+        counts["regions_clipped_to_reliable"] += statuses.count("clipped_to_reliable")
         counts["regions_unreliable"] += statuses.count("unreliable")
         print(f"  [✓] {result['frame_id']:<32} regions={len(regions)}  ok={statuses.count('ok')}"
-              f"  gsd={gsd:.3f} m/px")
+              f"  clipped={statuses.count('clipped_to_reliable')}"
+              f"  unreliable={statuses.count('unreliable')}  gsd={gsd:.3f} m/px")
 
     return counts
 
 
 def to_geojson(results):
-    """One Polygon feature per geolocated region. GeoJSON order is [lon, lat]."""
+    """One Polygon feature per geolocated region (ok or clipped_to_reliable).
+    GeoJSON order is [lon, lat]."""
     features = []
     for result in results:
         for i, region in enumerate(result.get("fire_regions") or []):
-            if region.get("geolocation_status") != "ok":
+            if region.get("geolocation_status") not in ("ok", "clipped_to_reliable"):
                 continue
             ring = [[p["lon"], p["lat"]] for p in region["gps_polygon"]]
             if ring[0] != ring[-1]:
@@ -178,6 +191,8 @@ def to_geojson(results):
                     "centroid_lat":          region["gps_centroid"]["lat"],
                     "centroid_lon":          region["gps_centroid"]["lon"],
                     "ground_area_m2":        region["ground_area_m2"],
+                    "clipped":               region["clipped"],
+                    "removed_area_fraction": region["removed_area_fraction"],
                     "touches_frame_edge":    region["touches_frame_edge"],
                     "timestamp":             result["geolocation"]["timestamp"],
                     "dilation_buffer_m":     result["geolocation"]["dilation_buffer_m"],
@@ -239,7 +254,7 @@ def main():
             json.dump(to_geojson(results), f, indent=2, allow_nan=False)
 
     print(f"\n[✓] Frames geolocated={counts['frames_geolocated']}  missing metadata={counts['frames_missing_metadata']}"
-          f"  regions ok={counts['regions_geolocated']}  partially unreliable={counts['regions_partially_unreliable']}"
+          f"  regions ok={counts['regions_geolocated']}  clipped={counts['regions_clipped_to_reliable']}"
           f"  unreliable={counts['regions_unreliable']}")
     print(f"[✓] Saved: {out_path}  ({args.output_format})")
 

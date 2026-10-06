@@ -318,14 +318,18 @@ python geolocate.py \
 | 5° | 1.1 km | 230 m |
 | 1° | 5.7 km | 5.7 km |
 
-Rays at or above the horizon never reach the ground; rays just below it land kilometres away with errors just as large. Such vertices are therefore marked unreliable rather than projected (default: less than 10° below the horizon). `docs/geolocation_worked_example.md` walks through one oblique projection by hand.
+Rays at or above the horizon never reach the ground; rays just below it land kilometres away with errors just as large. A ray is therefore reliable only if it is at least `--min_depression_deg` (default 10°) below the horizon and within `--max_range_m`. On flat ground that reliable area is a disk around the point below the drone (radius h / tan(min depression), or the max range if smaller). A region with unreliable vertices is **clipped to that disk** rather than dropped, and its centroid and area come from the clipped polygon. Only a region with no reliable part is `unreliable`. `docs/geolocation_worked_example.md` walks through one oblique projection by hand.
 
 **Swapping the metadata source.** Every loader implements one method, `load(frame_id, image_path) -> FrameMetadata` (`geoloc/metadata.py`). A telemetry-log loader only has to return the same `FrameMetadata`; `geolocate.py` and the math are unchanged.
 
 **What each region gets:**
-- `gps_polygon` — one entry per contour vertex, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic): `{lat, lon, ground_range_m, depression_deg}`. Unreliable vertices keep their slot with `lat`/`lon` = `null` and an `unreliable` reason (`above_horizon` / `below_min_depression` / `beyond_max_range`)
-- `gps_centroid` — area-weighted centroid computed on the ground (for oblique views the image-space centroid is not the ground centroid); `null` unless every vertex is reliable
-- `ground_area_m2` (same rule), `touches_frame_edge` (the fire continues outside the frame), `geolocation_status` (`ok` / `partially_unreliable` / `unreliable` / `missing_metadata`). GeoJSON output contains only `ok` regions
+- `geolocation_status` — `ok` (every vertex reliable, polygon unchanged), `clipped_to_reliable`, `unreliable` (no reliable part), or `missing_metadata`
+- `gps_polygon` — the reliable polygon, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic). Each vertex is `{lat, lon, ground_range_m, depression_deg}`; vertices created by clipping carry `"clip_vertex": true` (they lie on the reliability boundary, not on the fire edge). `null` for `unreliable` regions
+- `gps_centroid`, `ground_area_m2` — area-weighted centroid and area of that polygon, computed on the ground (for oblique views the image-space centroid is not the ground centroid)
+- `clipped`, `removed_area_fraction` — share of the original contour that was cut off, **measured in image pixels** (the removed part's ground area is unbounded or unreliable by definition); `unreliable_vertices` counts the original contour vertices by reason (`above_horizon` / `below_min_depression` / `beyond_max_range`)
+- `touches_frame_edge` — the fire continues outside the frame
+- GeoJSON output contains `ok` and `clipped_to_reliable` regions, with `clipped` and `removed_area_fraction` in the properties
+- Clipping assumes flat ground. With both limits disabled, a region that crosses the horizon cannot be bounded and is `unreliable`
 - `fire_front_arc` stays `null` (out of scope)
 
 Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward by roughly this distance, so GPS outlines are larger than the burning area.

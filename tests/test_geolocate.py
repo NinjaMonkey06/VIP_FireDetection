@@ -85,7 +85,7 @@ class GeolocateTest(unittest.TestCase):
 class TestGeolocateResults(GeolocateTest):
     def test_counts(self):
         self.assertEqual(self.counts, {"frames_geolocated": 3, "frames_missing_metadata": 1,
-                                       "regions_geolocated": 3, "regions_partially_unreliable": 1,
+                                       "regions_geolocated": 3, "regions_clipped_to_reliable": 1,
                                        "regions_unreliable": 1})
 
     def test_centered_square_uses_original_resolution(self):
@@ -124,43 +124,51 @@ class TestGeolocateResults(GeolocateTest):
         self.assertIsNone(r["fire_regions"][0]["gps_polygon"])
 
     def test_oblique_frame(self):
-        # Pitch -10°, fx = 320: TOP (rows 0..154) is entirely above the horizon. SQUARE's top
-        # edge (51.2 px above center → 9.1° above the axis) is ~1° below the horizon, i.e.
-        # ~6 km away and below the 10° default → unreliable; its bottom edge (~19° down) is fine.
+        # Pitch -10°, fx = 320, 100 m AGL → reliable disk radius 100 / tan(10°) = 567 m.
+        # TOP (rows 0..154) is entirely above the horizon → unreliable.
+        # SQUARE straddles the 10° line (the image center row): its top edge is ~1° below
+        # the horizon (~6 km away), its bottom edge ~19° (~290 m) → clipped to the near part.
         r = self.by_id["oblique"]
         top, center = r["fire_regions"]
         self.assertEqual(top["geolocation_status"], "unreliable")
-        self.assertEqual({v["unreliable"] for v in top["gps_polygon"]}, {"above_horizon"})
-        self.assertTrue(all(v["lat"] is None and v["ground_range_m"] is None for v in top["gps_polygon"]))
+        self.assertIsNone(top["gps_polygon"])
+        self.assertIsNone(top["gps_centroid"])
+        self.assertEqual(top["unreliable_vertices"], {"above_horizon": 4})
+        self.assertEqual(top["removed_area_fraction"], 1.0)
 
-        self.assertEqual(center["geolocation_status"], "partially_unreliable")
-        self.assertEqual([v.get("unreliable", "ok") for v in center["gps_polygon"]],
-                         ["below_min_depression", "below_min_depression", "ok", "ok"])
-        self.assertIsNone(center["gps_centroid"])
-        self.assertIsNone(center["ground_area_m2"])
+        self.assertEqual(center["geolocation_status"], "clipped_to_reliable")
+        self.assertTrue(center["clipped"])
+        self.assertEqual(center["unreliable_vertices"], {"below_min_depression": 2})
+        self.assertGreater(center["removed_area_fraction"], 0.4)
+        self.assertLess(center["removed_area_fraction"], 0.6)
+        self.assertGreater(center["ground_area_m2"], 0.0)
+        self.assertIsNotNone(center["gps_centroid"])
         for v in center["gps_polygon"]:
-            if "unreliable" in v:
-                self.assertIsNone(v["lat"])
-                self.assertLess(v["depression_deg"], 10.0)
-                self.assertGreater(v["ground_range_m"], 5000)
-            else:
-                self.assertIsNotNone(v["lat"])
-                self.assertGreater(v["depression_deg"], 18.0)
-                self.assertLess(v["ground_range_m"], 300)
+            self.assertGreaterEqual(v["depression_deg"], 9.99)
+            self.assertLessEqual(v["ground_range_m"], 567.2)
+        # The two reliable original vertices are kept; everything else came from clipping.
+        self.assertEqual(sum(not v.get("clip_vertex", False) for v in center["gps_polygon"]), 2)
         self.assertTrue(any("oblique" in w for w in r["geolocation"]["warnings"]))
 
     def test_oblique_limits_are_configurable(self):
         loader = SidecarCsvLoader(self.csv)
-        off = frame("oblique", [SQUARE])
-        geolocate.geolocate_results([off], CAMERA, loader, limits=ReliabilityLimits(None, None))
-        reg = off["fire_regions"][0]
-        self.assertEqual(reg["geolocation_status"], "ok")            # old behaviour: ~6 km polygon
-        self.assertGreater(max(v["ground_range_m"] for v in reg["gps_polygon"]), 5000)
 
-        capped = frame("oblique", [SQUARE])
-        geolocate.geolocate_results([capped], CAMERA, loader, limits=ReliabilityLimits(None, 250.0))
-        self.assertEqual({v["unreliable"] for v in capped["fire_regions"][0]["gps_polygon"]},
-                         {"beyond_max_range"})
+        def run(limits):
+            f = frame("oblique", [SQUARE])
+            geolocate.geolocate_results([f], CAMERA, loader, limits=limits)
+            return f["fire_regions"][0]
+
+        off = run(ReliabilityLimits(None, None))
+        self.assertEqual(off["geolocation_status"], "ok")             # old behaviour: ~6 km polygon
+        self.assertGreater(max(v["ground_range_m"] for v in off["gps_polygon"]), 5000)
+
+        capped = run(ReliabilityLimits(None, 400.0))
+        self.assertEqual(capped["geolocation_status"], "clipped_to_reliable")
+        self.assertLessEqual(max(v["ground_range_m"] for v in capped["gps_polygon"]), 400.0)
+        self.assertEqual(capped["unreliable_vertices"], {"beyond_max_range": 2})
+
+        # The whole square is farther than 250 m → nothing reliable.
+        self.assertEqual(run(ReliabilityLimits(None, 250.0))["geolocation_status"], "unreliable")
 
     def test_center_above_horizon_still_writes_strict_json(self):
         class LevelCamera:   # gimbal pointing at the horizon
@@ -211,7 +219,9 @@ class TestImageSizeSource(GeolocateTest):
 class TestGeoJson(GeolocateTest):
     def test_lon_lat_order_and_closed_rings(self):
         gj = geolocate.to_geojson(self.data["results"])
-        self.assertEqual(len(gj["features"]), 3)   # only fully reliable regions
+        self.assertEqual(len(gj["features"]), 4)   # 3 ok + 1 clipped; the unreliable one is left out
+        self.assertEqual(sorted(f["properties"]["clipped"] for f in gj["features"]),
+                         [False, False, False, True])
         for feat in gj["features"]:
             ring = feat["geometry"]["coordinates"][0]
             self.assertEqual(ring[0], ring[-1])
@@ -282,7 +292,7 @@ class TestCli(unittest.TestCase):
                         self.assertEqual(out["summary"]["geolocation"]["regions_geolocated"], 3)
                         self.assertEqual(out["summary"]["geolocation"]["min_depression_deg"], 10.0)
                     else:
-                        self.assertEqual(len(out["features"]), 3)
+                        self.assertEqual(len(out["features"]), 4)
 
 
 if __name__ == "__main__":
