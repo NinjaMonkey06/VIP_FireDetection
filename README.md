@@ -104,6 +104,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 │   └── projection.py   #   Pure math: pixel → ray → ground → lat/lon
 ├── camera_configs/     # dji_mini4pro.json (sample), template.json
 ├── tests/              # unittest suite (synthetic inputs only)
+├── docs/               # geolocation_worked_example.md (one pixel projected by hand)
 ├── THIRD_PARTY_LICENSES/
 │
 ├── dataset_processed/  # Output of preprocessing (aligned 256×256 pairs)
