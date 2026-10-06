@@ -1,0 +1,23 @@
+{
+  "_notes": [
+    "SAMPLE CONFIG — DJI Mini 4 Pro wide camera, 4:3 photo mode, ported from the citrus-uav-pipeline setup.",
+    "DJI publishes 82.1 deg FOV with a 24 mm format equivalent; only a DIAGONAL 82.1 deg matches 24 mm,",
+    "so fov_type is 'diagonal' (horizontal FOV = 69.73 deg). Not lens-calibrated: no distortion model.",
+    "altitude_reference 'takeoff': DJI RelativeAltitude is height above the take-off point, which equals",
+    "AGL only if the ground under the drone is level with the take-off point (flat-terrain assumption)."
+  ],
+  "name": "DJI Mini 4 Pro (sample)",
+  "calibration_width": 8064,
+  "calibration_height": 6048,
+  "fov_deg": 82.1,
+  "fov_type": "diagonal",
+  "dist_coeffs": [],
+  "altitude_reference": "takeoff",
+  "metadata_fields": {
+    "altitude_agl_m":   "xmp:drone-dji:RelativeAltitude",
+    "gimbal_yaw_deg":   "xmp:drone-dji:GimbalYawDegree",
+    "gimbal_pitch_deg": "xmp:drone-dji:GimbalPitchDegree",
+    "gimbal_roll_deg":  "xmp:drone-dji:GimbalRollDegree",
+    "timestamp":        "exif:DateTimeOriginal"
+  }
+}

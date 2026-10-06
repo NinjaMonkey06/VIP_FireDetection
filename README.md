@@ -24,6 +24,7 @@ A hybrid deep learning + classical computer vision pipeline for real-time wildfi
 - [Script Reference](#script-reference)
 - [Model Architecture](#model-architecture)
 - [Known Limitations](#known-limitations)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
@@ -51,11 +52,11 @@ RGB + Thermal Frame Pair
         │
         ▼
 ┌─────────────────────────────────────────────┐
-│   Phase 3: Geolocation + Tracking           │  ← geolocate.py
-│   MAVLink v2 telemetry (real or simulated)  │
-│   Pinhole camera back-projection            │
-│   Cross-frame fire tracking + velocity      │
-│   GPS polygon + fire wavefront arc output   │
+│   Phase 3: Geolocation                      │  ← geolocate.py + geoloc/
+│   Per-frame metadata (EXIF/XMP or CSV)      │
+│   Pinhole ray casting (any gimbal pitch)    │
+│   Flat-ground intersection → lat/lon        │
+│   GPS polygon + centroid + ground area      │
 └─────────────────────────────────────────────┘
         │
         ▼
@@ -96,7 +97,14 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── evaluate.py         # Test set evaluation with confusion matrix
 ├── infer.py            # Phase 1: inference on arbitrary image pairs
 ├── localize.py         # Phase 2: fire region localization (contour-based)
-├── geolocate.py        # Phase 3: GPS back-projection (fully specified stub)
+├── geolocate.py        # Phase 3: contour pixel → GPS (CLI)
+├── geoloc/             # Camera-agnostic geolocation library (no rendering code)
+│   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
+│   ├── metadata.py     #   FrameMetadata + loaders (EXIF/XMP, sidecar CSV)
+│   └── projection.py   #   Pure math: pixel → ray → ground → lat/lon
+├── camera_configs/     # dji_mini4pro.json (sample), template.json
+├── tests/              # unittest suite (synthetic inputs only)
+├── THIRD_PARTY_LICENSES/
 │
 ├── dataset_processed/  # Output of preprocessing (aligned 256×256 pairs)
 │   ├── rgb/
@@ -123,10 +131,7 @@ cd VIP_FireDetection
 pip install torch torchvision opencv-python pillow matplotlib scikit-learn pandas numpy
 ```
 
-For Phase 3 geolocation (once implementing `geolocate.py`):
-```bash
-pip install pymavlink pyproj
-```
+Phase 3 geolocation needs no extra packages (numpy, OpenCV and Pillow only).
 
 > **Note:** CUDA is supported automatically. The scripts fall back to CPU if no GPU is available.
 
@@ -263,49 +268,61 @@ python localize.py \
 
 ---
 
-### 6. Geolocation + Fire Tracking
+### 6. Geolocation
 
-`geolocate.py` is **implemented** (no longer a stub). It converts normalized image-space fire contour points from `localize.py` to GPS world coordinates using drone telemetry and camera intrinsics, **tracks each fire region across the frame sequence, and estimates a velocity vector (speed + heading) per track** from GPS centroid displacement over time. It then outputs GPS fire boundary polygons and wavefront arc polylines — using wind direction if provided, otherwise falling back to the fire's own tracked movement heading — ready for the fire propagation model.
-
-**Hardware specification (confirmed):**
-| Component | Specification |
-|-----------|--------------|
-| Thermal camera | FLIR HADRON 640R+, 13.6mm lens, 60Hz |
-| Altitude | Barometric + GPS fusion |
-| Gimbal | Real-time angle telemetry (pitch, roll, yaw) |
-| Telemetry format | MAVLink v2 over serial |
-
-Two telemetry sources are supported — swap `--telemetry_log` in once a real flight log exists, no other code changes needed:
+`geolocate.py` converts every fire contour from `localize.py` into GPS coordinates. **Must be run after `localize.py`.** It reads per-frame drone metadata (GPS position, altitude above ground, absolute gimbal yaw/pitch/roll, timestamp) and a camera config, casts a ray through each contour vertex, intersects it with flat ground, and converts the hit to lat/lon.
 
 ```bash
-# With a real MAVLink log:
+# Metadata from a sidecar CSV (one row per frame_id) — use this until real flight data exists
 python geolocate.py \
   --localization_json localization_results.json \
-  --telemetry_log flight.tlog \
-  --output_format geojson \
-  --wind_direction_deg 270
+  --camera_config camera_configs/<your_camera>.json \
+  --metadata_csv frame_metadata.csv
 
-# Without a flight log yet — simulated straight-line flight (for dev/testing):
+# Metadata read from the images' own EXIF GPS + XMP fields (e.g. DJI drone-dji:*)
 python geolocate.py \
   --localization_json localization_results.json \
-  --simulate_telemetry \
-  --sim_start_lat 34.1500 --sim_start_lon -117.8500 \
-  --sim_altitude_m 80 --sim_heading_deg 90 --sim_speed_mps 8 \
-  --fps 1.0
-
-# Sanity-check the math (no files needed):
-python geolocate.py --self_test
+  --camera_config camera_configs/dji_mini4pro.json \
+  --exif_image_dir custom_test/thermal \
+  --output_format geojson
 ```
 
-**Fire tracking / velocity:** each fire region is matched across frames by nearest GPS centroid (gated by `--max_track_distance_m`), producing a persistent `track_id`. Each region gets `velocity_mps`, `velocity_smoothed_mps` (moving average, window `--track_smoothing_window`), and `heading_deg` (degrees from North). Tracks tolerate up to `--max_coast_frames` consecutive frames with no matching detection (e.g. one missed frame) before being marked lost. Full per-track trajectory history is included in the output under `"tracks"`.
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--localization_json` | required | Output of `localize.py` |
+| `--camera_config` | required | Camera JSON — see below |
+| `--metadata_csv` / `--exif_image_dir` | one required | Metadata source |
+| `--csv_altitude_reference` | `agl` | What the CSV altitude column is relative to: `agl` / `takeoff` / `msl` |
+| `--output_json` | `geolocated_results.json` | Output path (extension follows `--output_format`) |
+| `--output_format` | `json` | `json` (full results) or `geojson` (one Polygon per region, `[lon, lat]` order) |
 
-**Known limitation:** `infer.py`/`localize.py` don't yet record a per-frame capture timestamp, so `geolocate.py` currently assigns timestamps sequentially from `--fps` in frame order. This is fine for `--simulate_telemetry` (generated on the same clock) but is an approximation for real flights — for rigorous results, add a real capture timestamp to `inference_results.json` upstream.
+**Sidecar CSV columns:** `frame_id, latitude, longitude, altitude_agl_m, gimbal_yaw_deg, gimbal_pitch_deg, gimbal_roll_deg[, timestamp]` — yaw clockwise from north, pitch `-90` = straight down, timestamp ISO 8601. Every column except `timestamp` must be filled; frames with missing metadata are reported as `missing_metadata` and never projected with guessed values.
 
-**Dependencies:**
+**Camera configs (`camera_configs/`).** All camera-specific values live here, so swapping cameras is a config change. The final camera is not confirmed yet (a FLIR Hadron is the likely candidate); copy `template.json` once it is.
+- Intrinsics: either `fx, fy[, cx, cy]` from a checkerboard calibration (preferred) or `fov_deg` + `fov_type` (`horizontal` / `vertical` / `diagonal`). The FOV type is mandatory because most datasheets quote **diagonal** FOV.
+- `dist_coeffs` (OpenCV order), optional `crop`, `altitude_reference`, and a `metadata_fields` mapping for the EXIF/XMP loader (`xmp:<prefix:Name>`, `exif:<TagName>` or `const:<value>`).
+- Intrinsics are rescaled to each image's resolution, but only for a plain resize: if the image's aspect ratio differs from the calibrated frame by more than rounding, it is rejected — add a `crop` entry instead.
+- `dji_mini4pro.json` is a **sample only**, ported from the reference pipeline: 82.1° **diagonal** FOV (only the diagonal reading is consistent with DJI's 24 mm-equivalent spec).
+
+> **Note on this repo's sample frames:** the thermal images behind `Sample Localization Output/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
+
+**Swapping the metadata source.** Every loader implements one method, `load(frame_id, image_path) -> FrameMetadata` (`geoloc/metadata.py`). A telemetry-log loader only has to return the same `FrameMetadata`; `geolocate.py` and the math are unchanged.
+
+**What each region gets:**
+- `gps_polygon` — `[{lat, lon}, …]` for every contour vertex, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic)
+- `gps_centroid` — area-weighted centroid computed on the ground (for oblique views the image-space centroid is not the ground centroid)
+- `ground_area_m2`, `touches_frame_edge` (the fire continues outside the frame), `geolocation_status` (`ok` / `crosses_horizon` / `missing_metadata`)
+- `fire_front_arc` stays `null` (out of scope)
+
+Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward by roughly this distance, so GPS outlines are larger than the burning area.
+
+**Running the tests** (standard library `unittest`, synthetic inputs only):
 ```bash
-pip install pymavlink   # only needed for --telemetry_log with a real .tlog/.bin
+python -m unittest discover -s tests -t .
+python -m tests.test_citrus_oracle    # prints the reference-code error table
 ```
-`pyproj` is not required — GPS math uses the spherical-earth approximation specified in the design (haversine distance, equirectangular local-meters conversion), matching the original spec.
+
+**Attribution.** The geolocation approach is adapted from [citrus-uav-pipeline](https://github.com/afif1230/citrus-uav-pipeline) by Afif El Bsat (MIT License — see `THIRD_PARTY_LICENSES/citrus-uav-pipeline.txt`). Differences from the reference: the image is never rotated (yaw rotates the ray, so focal length does not depend on a rotated canvas size), the FOV type is explicit, any gimbal pitch is supported, and missing metadata is never replaced by defaults. `tests/test_citrus_oracle.py` documents the two scale issues found in the reference (FOV interpreted as horizontal, focal length taken from the rotated canvas) with concrete numbers.
 
 ---
 
@@ -376,7 +393,7 @@ pip install pymavlink   # only needed for --telemetry_log with a real .tlog/.bin
 - `pixel_256` — ordered contour points in 256×256 processing space
 - `normalized` — same points in [0,1] range, resolution-agnostic. This is what `geolocate.py` consumes to back-project to GPS coordinates.
 - `original_wh` — actual thermal image dimensions at inference time, for reference
-- `gps_polygon` / `fire_front_arc` — null placeholders populated by `geolocate.py`
+- `gps_polygon` — null here; filled by `geolocate.py` (see [Geolocation](#6-geolocation)). `fire_front_arc` stays null
 
 **Output format options (`--output_format`):**
 | Format | File | Best for |
@@ -398,7 +415,8 @@ pip install pymavlink   # only needed for --telemetry_log with a real .tlog/.bin
 | `evaluate.py` | Test set evaluation — confusion matrix display |
 | `infer.py` | Phase 1 inference on arbitrary image pairs — outputs JSON + optional 3-panel visualizations |
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
-| `geolocate.py` | Phase 3 — GPS back-projection, fire tracking, and velocity vector estimation. Supports real MAVLink logs or simulated telemetry. |
+| `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
+| `geoloc/` | Geolocation library: `camera.py` (config), `metadata.py` (loaders), `projection.py` (pure geometry) |
 
 ---
 
@@ -446,10 +464,18 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Thermal palette domain shift** — the model was trained on a single sensor platform. Different thermal cameras apply different color mappings, which can cause misclassification on out-of-distribution hardware. Mitigation: cross-sensor normalization or multi-platform fine-tuning.
 - **Fixed processing resolution** — both modalities are resized to 256×256. Small or distant fire regions may lose spatial detail. A multiscale inference approach could improve small-source detection.
 - **No temporal modeling** — frames are processed independently. A UAV video stream has strong temporal correlation that is currently unused.
-- **Flat-earth geolocation assumption** — the back-projection in `geolocate.py` assumes flat terrain at the drone's GPS altitude. Mountainous terrain requires DEM (Digital Elevation Model) intersection for accurate GPS projection.
-- **No per-frame capture timestamps yet** — `geolocate.py`'s fire tracking and velocity estimates rely on `--fps`-based sequential timestamps rather than real capture times, since `infer.py`/`localize.py` don't currently record one. Fine for simulated telemetry; an approximation for real flights until upstream timestamp capture is added.
-- **Geolocation validated with simulated telemetry only** — `geolocate.py` is implemented and self-tested (`--self_test`) against known-correct nadir/off-nadir projections, but has not yet been validated against a real MAVLink flight log. Swap `--simulate_telemetry` for `--telemetry_log` once one is available.
-- **Fire tracking uses simple nearest-centroid matching** — adequate for a handful of fire regions per frame and easy to justify (explainable, consistent with the project's classical-CV design philosophy), but could misassociate tracks if two fire fronts cross paths within one frame interval. A Kalman filter or Hungarian-algorithm assignment would be a natural upgrade if that becomes an issue.
+- **Flat-ground geolocation** — rays are intersected with a horizontal plane at the drone's altitude above ground. In hilly terrain the error grows with height error × tan(off-nadir angle) (e.g. 20 m of relief at 30° off-axis ≈ 11.5 m). A DEM can be added behind the `Terrain` interface in `geoloc/projection.py`.
+- **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning.
+- **Geolocation tested on synthetic data only** — no real per-frame metadata exists for the FLAME-2 frames used here, and the final camera is not confirmed. The math is unit-tested against hand-computed cases but has not yet been validated against surveyed ground points.
+- **Polygons include the dilation buffer** — `localize.py`'s region-merging dilation enlarges every contour; `dilation_buffer_m` reports the approximate size.
+- **No lever-arm or time-sync correction** — the GPS antenna is assumed to be at the camera, and metadata is assumed to be captured at the same instant as the frame.
+
+---
+
+## Acknowledgments
+
+- Geolocation adapted from [citrus-uav-pipeline](https://github.com/afif1230/citrus-uav-pipeline) (MIT License, Copyright (c) 2026 afif1230):
+  A. El Bsat, A. Mohanna, B. Kaddouh, "Unified RGB-UAV Pipeline for Citrus Tree Detection, Geotagging, and HLB Health Assessment," *IEEE International Geoscience and Remote Sensing Symposium (IGARSS)*, 2026.
 
 ---
 
