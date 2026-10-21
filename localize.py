@@ -11,6 +11,9 @@ Pipeline per frame:
         → Contour extraction + approxPolyDP simplification
         → Area filtering
         → Polyline arc output        (pixel_256 + normalized + GeoJSON/CSV)
+        → Fire pixels per region     (the undilated hot pixels the outline covers,
+                                      as row runs; geolocate.py turns them into a
+                                      burning area, since the outline is a fire zone)
 
 Changes v3 → v4 (based on supervisor feedback):
     1. Region merging via mask dilation:
@@ -119,21 +122,45 @@ def extract_contours(mask, min_area, max_area, epsilon_factor):
     return filtered
 
 
-def encode_contours(contours, original_size):
+def mask_runs(mask):
+    """[[row, first_col, last_col], ...] of the nonzero pixels of a 2-D mask, row by row."""
+    d = np.diff(np.pad((mask > 0).astype(np.int8), ((0, 0), (1, 1))), axis=1)
+    rows, starts = np.nonzero(d == 1)
+    _, ends = np.nonzero(d == -1)
+    return [[int(r), int(a), int(b) - 1] for r, a, b in zip(rows, starts, ends)]
+
+
+def fire_pixel_runs(mask, dilated_mask, contours):
+    """Per contour, the pixels of the undilated fire mask inside its merged region, as
+    row runs. The outline includes the merge dilation and the gaps between merged hot
+    spots; these are the pixels that are actually hot."""
+    _, labels = cv2.connectedComponents((dilated_mask > 0).astype(np.uint8))
+    runs = []
+    for cnt in contours:
+        x, y = cnt.reshape(-1, 2)[0]          # contour vertices are pixels of their region
+        runs.append(mask_runs((mask > 0) & (labels == labels[y, x])))
+    return runs
+
+
+def encode_contours(contours, original_size, fire_runs=None):
     orig_w, orig_h = original_size
     encoded = []
-    for cnt in contours:
+    for i, cnt in enumerate(contours):
         pts = cnt.reshape(-1, 2)
-        encoded.append({
+        region = {
             "pixel_256":      [{"x": int(p[0]), "y": int(p[1])} for p in pts],
             "normalized":     [{"x": round(float(p[0]) / PROCESS_SIZE, 6),
                                 "y": round(float(p[1]) / PROCESS_SIZE, 6)} for p in pts],
             "area_px":        round(float(cv2.contourArea(cnt)), 2),
             "n_points":       len(pts),
             "original_wh":    {"width": orig_w, "height": orig_h},
-            "gps_polygon":    None,   # filled by geolocate.py
-            "fire_front_arc": None    # filled by geolocate.py
-        })
+        }
+        if fire_runs is not None:
+            region["fire_area_px"] = sum(r[2] - r[1] + 1 for r in fire_runs[i])
+            region["fire_pixels_256"] = fire_runs[i]   # [row, first_col, last_col] at 256x256
+        region["gps_polygon"] = None      # filled by geolocate.py
+        region["fire_front_arc"] = None   # filled by geolocate.py
+        encoded.append(region)
     return encoded
 
 
@@ -288,7 +315,8 @@ def main():
         mask, otsu_thresh, applied_thresh = otsu_fire_mask(gray, args.otsu_blur_kernel, args.threshold_scale)
         dilated_mask    = dilate_mask_for_merging(mask, args.merge_kernel_size)
         contours        = extract_contours(dilated_mask, args.min_contour_area, args.max_contour_area, args.epsilon_factor)
-        encoded_regions = encode_contours(contours, original_size)
+        encoded_regions = encode_contours(contours, original_size,
+                                          fire_pixel_runs(mask, dilated_mask, contours))
 
         result.update({
             "localization_run":  True,

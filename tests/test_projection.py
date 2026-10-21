@@ -14,7 +14,7 @@ from geoloc.projection import (
     ABOVE_HORIZON, BELOW_MIN_DEPRESSION, BEYOND_MAX_RANGE, EARTH_RADIUS_M, VERTEX_OK,
     CameraPose, Intrinsics, ReliabilityLimits, camera_to_ned, clip_polygon_disk, polygon_area,
     ground_sample_distance_m, ground_to_pixels, latlon_to_offset,
-    normalized_to_pixels, offset_to_latlon, pixels_to_ground,
+    normalized_to_pixels, offset_to_latlon, pixel_runs_ground_area, pixels_to_ground,
     pixels_to_normalized, polygon_area_centroid, project_contour,
 )
 from tests import test_citrus_oracle as citrus
@@ -405,6 +405,38 @@ class TestTerrainInterface(unittest.TestCase):
                 return rays[:, :2] * ((camera_height_m - 20.0) / rays[:, 2])[:, None]
         ne = pixels_to_ground(np.array([[500.0, 150.0]]), INTR, CameraPose(ALT, 0.0), RaisedGround())
         np.testing.assert_allclose(ne[0], [40.0, 0.0], atol=1e-9)
+
+
+class TestFirePixelArea(unittest.TestCase):
+    # 1000x800 image on a 250x200 grid: each cell is 4x4 image pixels
+    CELL = 4.0
+
+    def test_nadir_area_is_pixel_count_times_gsd(self):
+        runs = [[100, 120, 129], [101, 120, 129], [102, 125, 125]]          # 21 cells
+        area, excluded = pixel_runs_ground_area(runs, self.CELL, self.CELL, INTR, CameraPose(ALT, 30.0))
+        gsd = ALT / INTR.fx
+        self.assertAlmostEqual(area, 21 * (self.CELL * gsd) ** 2, places=9)
+        self.assertEqual(excluded, 0.0)
+
+    def test_oblique_runs_add_up_to_the_projected_rectangle(self):
+        # A block split into row runs covers exactly the ground quadrilateral of the block.
+        pose = CameraPose(ALT, 40.0, -35.0, 3.0)
+        runs = [[r, 80, 139] for r in range(150, 170)]
+        area, _ = pixel_runs_ground_area(runs, self.CELL, self.CELL, INTR, pose)
+        block = np.array([[80, 150], [140, 150], [140, 170], [80, 170]]) * self.CELL
+        self.assertAlmostEqual(area, polygon_area(pixels_to_ground(block, INTR, pose)), places=6)
+
+    def test_runs_beyond_the_reliable_limit_are_excluded(self):
+        pose = CameraPose(ALT, 0.0, -10.0, 0.0)        # optical axis 10° below the horizon
+        near = [[190, 100, 109]]                        # bottom rows: steep, reliable
+        far = [[95, 100, 109], [96, 100, 104]]          # just below the image centre: < 10°
+        area_near, _ = pixel_runs_ground_area(near, self.CELL, self.CELL, INTR, pose)
+        area, excluded = pixel_runs_ground_area(near + far, self.CELL, self.CELL, INTR, pose)
+        self.assertAlmostEqual(area, area_near, places=9)
+        self.assertAlmostEqual(excluded, 15 / 25)
+
+    def test_no_runs(self):
+        self.assertEqual(pixel_runs_ground_area([], self.CELL, self.CELL, INTR, CameraPose(ALT, 0.0)), (0.0, 0.0))
 
 
 if __name__ == "__main__":

@@ -83,6 +83,20 @@ class GeolocateTest(unittest.TestCase):
 
 
 class TestGeolocateResults(GeolocateTest):
+    def test_fire_area_from_hot_pixels(self):
+        data = [frame("nadir", [SQUARE])]
+        data[0]["fire_regions"][0]["fire_pixels_256"] = [[120, 110, 119], [121, 110, 119]]   # 20 cells
+        geolocate.geolocate_results(data, CAMERA, SidecarCsvLoader(self.csv))
+        reg = data[0]["fire_regions"][0]
+        cell_m2 = (640 / 256 * 0.3125) * (512 / 256 * 0.3125)       # 0.3125 m/px at 100 m
+        self.assertAlmostEqual(reg["fire_area_m2"], 20 * cell_m2, places=2)
+        self.assertEqual(reg["fire_area_excluded_fraction"], 0.0)
+        self.assertLess(reg["fire_area_m2"], reg["ground_area_m2"])
+
+    def test_fire_area_absent_without_hot_pixels(self):
+        reg = self.by_id["nadir"]["fire_regions"][0]
+        self.assertIsNone(reg["fire_area_m2"])
+
     def test_counts(self):
         self.assertEqual(self.counts, {"frames_geolocated": 3, "frames_missing_metadata": 1,
                                        "regions_geolocated": 3, "regions_clipped_to_reliable": 1,

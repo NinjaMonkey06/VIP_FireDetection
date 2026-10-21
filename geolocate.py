@@ -12,8 +12,11 @@ Pipeline per region:
         → north/east meters → lat/lon
         → area-weighted centroid + ground area (computed in meters)
 
-Fills per region: gps_polygon, gps_centroid, ground_area_m2, touches_frame_edge,
-geolocation_status. fire_front_arc is left null (out of scope).
+Fills per region: gps_polygon, gps_centroid, ground_area_m2, fire_area_m2,
+touches_frame_edge, geolocation_status. fire_front_arc is left null (out of scope).
+ground_area_m2 is the area of the outline, a fire zone (merged hot spots and the
+gaps between them); fire_area_m2 is the ground area of the hot pixels themselves
+(from localize.py's fire_pixels_256).
 
 Oblique views: a ray above the horizon, less than --min_depression_deg below it
 (default 10°), or landing farther than --max_range_m (default off) is unreliable.
@@ -51,7 +54,7 @@ import numpy as np
 from geoloc.camera import load_camera_config
 from geoloc.metadata import ExifXmpLoader, LaserHeightLoader, MetadataError, SidecarCsvLoader
 from geoloc.projection import (FLAT_TERRAIN, ReliabilityLimits, ground_sample_distance_m,
-                               project_contour)
+                               pixel_runs_ground_area, project_contour)
 
 PROCESS_SIZE = 256   # must match localize.py (pixel_256 coordinate space)
 
@@ -95,6 +98,16 @@ def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
         if s != "ok":
             reasons[s] = reasons.get(s, 0) + 1
 
+    # The outline is a fire zone (hot spots merged by dilation, plus the gaps between
+    # them); the burning area comes from the hot pixels themselves.
+    fire_area, fire_excluded = None, None
+    if region.get("fire_pixels_256"):
+        fire_area, fire_excluded = pixel_runs_ground_area(
+            region["fire_pixels_256"], W / PROCESS_SIZE, H / PROCESS_SIZE, intr, meta.pose(),
+            terrain, limits)
+        if fire_excluded >= 1.0:
+            fire_area = None
+
     region.update({
         "gps_polygon":    None if pc.polygon_north_east is None else
                           [encode_vertex(lat, lon, ne, clip, meta.altitude_agl_m)
@@ -103,6 +116,8 @@ def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
         "gps_centroid":   None if pc.centroid_latlon is None else
                           {"lat": round(pc.centroid_latlon[0], 8), "lon": round(pc.centroid_latlon[1], 8)},
         "ground_area_m2": None if pc.area_m2 is None else round(pc.area_m2, 2),
+        "fire_area_m2":   None if fire_area is None else round(fire_area, 2),
+        "fire_area_excluded_fraction": None if fire_excluded is None else round(fire_excluded, 4),
         "clipped":        pc.clipped,
         "removed_area_fraction": round(pc.removed_area_fraction, 4),
         "unreliable_vertices": reasons,     # original contour vertices, by reason
@@ -200,6 +215,7 @@ def to_geojson(results):
                     "centroid_lat":          region["gps_centroid"]["lat"],
                     "centroid_lon":          region["gps_centroid"]["lon"],
                     "ground_area_m2":        region["ground_area_m2"],
+                    "fire_area_m2":          region.get("fire_area_m2"),
                     "clipped":               region["clipped"],
                     "removed_area_fraction": region["removed_area_fraction"],
                     "touches_frame_edge":    region["touches_frame_edge"],

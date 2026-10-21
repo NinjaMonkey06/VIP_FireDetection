@@ -9,7 +9,8 @@ geolocated frame, draws on the original thermal image:
       100 / 200 / 400 m), projected into the image
     - the reliability limit of the run (--min_depression_deg / --max_range_m of
       geolocate.py) and the horizon
-A side panel lists each region's GPS centroid, ground area and distance.
+A side panel lists each region's GPS centroid, distance, zone area (the outline)
+and burning area (the hot pixels), when localize.py provided them.
 
 Rendering only. The geometry comes from geoloc/ with the same camera config
 and drone pose geolocate.py used (read back from the JSON), so what is drawn
@@ -134,8 +135,10 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
             cpx = latlon_to_px(lat0, lon0, np.array([[c["lat"], c["lon"]]]), intr, pose)[0]
             north, east = latlon_to_offset(lat0, lon0, c["lat"], c["lon"])
             note = f"  [clipped {region['removed_area_fraction']:.0%}]" if region["clipped"] else ""
-            lines.append((color, f"#{i}  {c['lat']:.6f}, {c['lon']:.6f}\n"
-                                 f"     {region['ground_area_m2']:,.0f} m²  |  {math.hypot(north, east):.0f} m away{note}"))
+            burning = (f"  |  burning {region['fire_area_m2']:,.0f} m²"
+                       if region.get("fire_area_m2") is not None else "")
+            lines.append((color, f"#{i}  {c['lat']:.6f}, {c['lon']:.6f}  |  {math.hypot(north, east):.0f} m away\n"
+                                 f"     zone {region['ground_area_m2']:,.0f} m²{burning}{note}"))
         else:
             cpx = original.mean(axis=0)
             lines.append((color, f"#{i}  {status}: no reliable part"))
@@ -143,7 +146,7 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
                 ha="center", va="center", path_effects=OUTLINE)
 
     panel.axis("off")
-    panel.set_title("Fire regions (GPS centroid, ground area, distance from drone)", fontsize=9)
+    panel.set_title("Fire regions (GPS centroid, distance from drone, zone and burning area)", fontsize=9)
     y = 0.97
     for color, text in lines:
         panel.text(0.0, y, text, color=color[:3], fontsize=8.5, family="monospace", va="top",

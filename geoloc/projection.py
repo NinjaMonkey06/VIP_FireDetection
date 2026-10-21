@@ -405,3 +405,33 @@ def project_contour(points_px: np.ndarray, intr: Intrinsics, pose: CameraPose,
     clat, clon = offset_to_latlon(lat0, lon0, cn, ce)
     return ProjectedContour(*diagnostics, polygon, np.column_stack((plat, plon)), clip_vertex,
                             clipped, removed, area, (float(clat), float(clon)))
+
+
+# ==================== Fire pixels ====================
+def pixel_runs_ground_area(runs, cell_w: float, cell_h: float, intr: Intrinsics, pose: CameraPose,
+                           terrain: Terrain = FLAT_TERRAIN,
+                           limits: ReliabilityLimits = ReliabilityLimits()) -> Tuple[float, float]:
+    """Ground area of fire pixels given as runs [row, first_col, last_col] on a grid
+    whose cell (col, row) covers image pixels [col·cell_w, (col+1)·cell_w] x
+    [row·cell_h, (row+1)·cell_h]. A run is a rectangle in the image and, on flat
+    ground, straight lines stay straight, so the quadrilateral of its projected corners
+    is its exact footprint.
+
+    A run counts only if all four corners are reliable (same per-vertex rule as
+    contours). Returns (area_m2 of the reliable runs, fraction of pixels excluded)."""
+    runs = np.asarray(runs, dtype=np.float64).reshape(-1, 3)
+    if len(runs) == 0:
+        return 0.0, 0.0
+    row, first, last = runs[:, 0], runs[:, 1], runs[:, 2] + 1.0
+    corners = np.stack([np.column_stack((first, row)), np.column_stack((last, row)),
+                        np.column_stack((last, row + 1.0)), np.column_stack((first, row + 1.0))], axis=1)
+    rays = pixels_to_rays_ned((corners * [cell_w, cell_h]).reshape(-1, 2), intr, pose)
+    ne = terrain.intersect(pose.altitude_agl_m, rays)
+    status = classify_vertices(np.hypot(ne[:, 0], ne[:, 1]), depression_deg(rays), limits)
+    ok = np.array([s == VERTEX_OK for s in status]).reshape(-1, 4).all(axis=1)
+
+    quads = ne.reshape(-1, 4, 2)
+    n, e = quads[..., 0], quads[..., 1]
+    area = 0.5 * np.abs((e * np.roll(n, -1, axis=1) - np.roll(e, -1, axis=1) * n).sum(axis=1))
+    pixels = runs[:, 2] - runs[:, 1] + 1.0
+    return float(area[ok].sum()), float(pixels[~ok].sum() / pixels.sum())
