@@ -204,7 +204,7 @@ class LaserHeightLoader(ExifXmpLoader):
             return fallback, reference, "no laser fields; used the altitude field"
         if distance <= 0.0:
             return fallback, reference, "no laser reading; used the altitude field"
-        height = round(drone - target, 3)  # DJI writes altitudes to the millimetre
+        height = drone - target
         offset = fallback - height    # laser ground point relative to the altitude reference
         if height <= 0.0 or abs(offset) > self.max_terrain_offset_m:
             return fallback, reference, (f"laser height {height:.1f} m rejected: ground point "
