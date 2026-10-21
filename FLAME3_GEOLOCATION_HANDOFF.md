@@ -8,13 +8,19 @@
 - M30T camera config
 - laser-height altitude option, with a check against the laser rangefinder
 
-**Next:** ground-truth fire masks from the TIFFs, then the full classify → localize → geolocate run (§7).
+**Next:** localization run on the Fire frames (folder labels, no classifier), checked against TIFF fire masks; then geolocation checks in practice (§7).
 
 ---
 
 ## 1. Goal
 
-Test the **geolocation stage** of the fire-detection pipeline on real, labeled RGB + thermal drone imagery whose camera and per-image pose are fully known. Geolocation must work from **any viewing angle**, not only straight down (supervisor requirement).
+Use FLAME 3 to test two stages of the pipeline on real drone imagery:
+- **Localization** (`localize.py`), already tested on FLAME 2: does it still find the fire on a new camera and scene?
+- **Geolocation** (`geolocate.py`), so far only verified in theory: does it put the fire in the right place in practice?
+
+The classifier is **out of scope**. The folder labels decide which frames are fire frames, so a classifier miss can't be confused with a localization or geolocation error.
+
+FLAME 3 is **test data only**. The project's real camera and viewing angles are undecided, so the code stays camera-agnostic: switching cameras means a new `camera_configs/*.json` (FOV/intrinsics and metadata mapping), never a code change. Geolocation must work from **any viewing angle**, not only straight down (supervisor requirement).
 
 Pipeline in this repo (see `README.md`):
 - `infer.py`: MidFusionNet classifier, fire yes/no.
@@ -148,20 +154,21 @@ The default 10° depression limit makes almost all of frame `00001` unreliable (
 1. ~~**Metadata audit**~~ (done, §3).
 2. ~~**Pairing check**~~ (done, §2).
 3. ~~**Camera model + altitude source**~~ (done, §4–6).
-4. **Ground-truth fire masks** from the Celsius TIFFs (>200 °C fire, <80 °C not fire, in between ignored). These score `localize.py` independently of the classifier.
-5. **Classifier on FLAME 3.** Compare `infer.py` with the folder labels. The thermal JPGs use a palette colour map that FLAME-2 training never saw, so first **try feeding normalized TIFF temperatures as grayscale**. Only conclude there's a palette/domain accuracy drop if both inputs fail. RGB input: the Corrected FOV images.
-6. **Full run, per class, both altitude sources:** `infer.py` → `localize.py` → `geolocate.py --exif_image_dir <class>/RGB/Raw --camera_config camera_configs/dji_m30t_thermal.json`, once with `--altitude_source metadata` and once with `--altitude_source laser`. Report:
-   - classifier accuracy
-   - localization vs TIFF masks
-   - region status counts (ok / clipped / unreliable)
-   - frames per altitude reference
-   - centre error vs laser with both sources (§6), labelled as above
-   - consistency of fire centroids across consecutive frames
-   - a map of fire centroids
-7. **Terrain model** (USGS 3DEP or SRTM) behind the `Terrain` interface. This is the general replacement for the laser, and matters at Sycan, where a hillside borders the meadow.
-8. **North reference check:** confirm DJI yaw is true north. Use a georeferenced feature (road, burn-unit edge) on a satellite basemap, or the GCPs.
-9. **Accuracy scoring:** detect GCP markers in the NADIR plots, geolocate them, and compute error against the surveyed coordinates. It's a different camera (XT709: thermal 640×512, 13 mm, 12 µm), straight down only.
-10. **Uncertainty ring:** Monte Carlo over ±pitch, ±yaw, ±fx (±1%), GPS and altitude, drawn on the overlay.
+4. **Localization run, no classifier.** Build `inference_results.json` from the folder labels (Fire → `fire_detected: true`). Run `localize.py` on `Fire/Thermal/Raw JPG`. `localize.py` converts the palette image to luminance; keep the default parameters first.
+5. **Localization check** against ground-truth fire masks from the Celsius TIFFs (>200 °C fire, <80 °C not fire, in between ignored). Per frame, measure:
+   - recall of fire pixels
+   - share of each polygon that is actually hot
+   - regions missed or spurious
+
+   No Fire frames give the false-positive rate (`localize.py` would only run on them if the classifier misfired; run them anyway to see).
+6. **Geolocation run:** `geolocate.py --exif_image_dir Fire/RGB/Raw --camera_config camera_configs/dji_m30t_thermal.json`, once with `--altitude_source metadata` and once with `--altitude_source laser`. Report region status counts (ok / clipped / unreliable) and frames per altitude reference.
+7. **Geolocation checks in practice**, from cheapest to strongest:
+   1. *Laser boresight* (done, §6): altitude and angle conventions; partly circular.
+   2. *Multi-view consistency:* the same fire seen from different drone positions and headings within a short time should land in the same place. This exercises the whole chain, including fx, the principal point and off-centre pixels, and is independent of DJI's own projection.
+   3. *Absolute placement on a satellite basemap:* geolocated fire polygons should fall inside the burn scar of the October 2022 Sycan burns, visible in later Sentinel-2/NAIP imagery. This also checks for a yaw / true-north bias, which checks 1 and 2 cannot detect.
+   4. *(Optional, later)* NADIR plots: surveyed GCPs give an absolute error number. They come from a different camera (XT709, straight down), so they double as a test that only the camera config changes between cameras.
+
+**Out of scope for this dataset:** classifier evaluation (including the grayscale-TIFF classifier input), uncertainty ring, velocity overlay. **Kept on the general list:** a terrain model behind the `Terrain` interface, the general replacement for the laser height.
 
 ---
 
