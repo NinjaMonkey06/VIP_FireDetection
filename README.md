@@ -112,7 +112,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 │   └── flame2_sample_early/  # earlier 7-frame FLAME 2 localization output
 ├── data/               # Datasets, git-ignored (download separately)
 │   ├── flame3/         #   FLAME 3 CV subset (Sycan Marsh): Fire/, No Fire/
-│   └── flame3_test/    #   39-frame test subset (34 Fire, 5 No Fire), same layout
+│   └── flame3_test/    #   39-frame test subset (34 Fire, 5 No Fire): <class>/RGB, <class>/Thermal (+ Celsius TIFF/)
 ├── THIRD_PARTY_LICENSES/
 │
 ├── dataset_processed/  # Output of preprocessing (aligned 256×256 pairs)
