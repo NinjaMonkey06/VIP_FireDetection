@@ -3,17 +3,20 @@ laser_check.py — Geolocation of the boresight vs the M30T laser rangefinder (F
 =====================================================================================
 For every raw RGB frame whose laser has a reading, projects the camera boresight
 (the principal point of the camera config) to the ground with the same loaders
-geolocate.py uses, and compares it with the laser's ground point
+geolocate.py uses, and compares it with the laser's hit point
 (drone-dji:LRFTargetLat/Lon).
 
-Run it once per altitude source:
-    metadata  take-off-relative altitude, the honest baseline: no rangefinder needed.
-    laser     height above the laser ground point. The laser's distance then sets
-              the height, so the remaining error mostly tests the angles and DJI's
-              own projection, not altitude. It is not an independent accuracy number.
+The laser hit point is NOT ground truth: the laser measures the first surface it
+hits, and on FLAME 3 most readings hit canopy or smoke 3–60 m above the ground
+(checked against SRTM). So:
+    metadata  take-off-relative altitude. The difference to the laser point mixes
+              altitude error with the laser hitting trees; it is not a ground error.
+    laser     height above the laser hit point. The laser's distance then sets the
+              height, so the remaining error tests the angle conventions against
+              DJI's own projection. Not an independent accuracy number.
 
 The boresight pixel is independent of the focal length, so this checks altitude and
-angles, not fx.
+angles, not fx. Expects the dataset layout <class>/RGB/Raw.
 
 Usage:
     python experiments/flame3/laser_check.py --dataset_root data/flame3 \

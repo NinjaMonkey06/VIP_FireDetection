@@ -302,7 +302,7 @@ python geolocate.py \
 | `--localization_json` | required | Output of `localize.py` |
 | `--camera_config` | required | Camera JSON — see below |
 | `--metadata_csv` / `--exif_image_dir` | one required | Metadata source |
-| `--altitude_source` | `metadata` | With `--exif_image_dir`: `metadata` uses the altitude field; `laser` uses drone altitude minus the laser rangefinder's ground point where the frame has a reading, and falls back to the altitude field otherwise |
+| `--altitude_source` | `metadata` | With `--exif_image_dir`: `metadata` uses the altitude field; `laser` uses drone altitude minus the laser rangefinder's hit point where the frame has a reading, and falls back to the altitude field otherwise. The laser measures the first surface it hits (treetops, smoke), so over vegetation `laser` heights are too low |
 | `--laser_max_terrain_offset_m` | `50` | Reject a laser height whose ground point lies farther than this above or below the altitude field's reference (laser hit smoke or a distant ridge) |
 | `--csv_altitude_reference` | `agl` | What the CSV altitude column is relative to: `agl` / `takeoff` / `msl` |
 | `--min_depression_deg` | `10` | Vertices whose ray is less than this many degrees below the horizon are marked unreliable. Negative = off |
@@ -337,7 +337,8 @@ Rays at or above the horizon never reach the ground; rays just below it land kil
 **What each region gets:**
 - `geolocation_status` — `ok` (every vertex reliable, polygon unchanged), `clipped_to_reliable`, `unreliable` (no reliable part), or `missing_metadata`
 - `gps_polygon` — the reliable polygon, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic). Each vertex is `{lat, lon, ground_range_m, depression_deg}`; vertices created by clipping carry `"clip_vertex": true` (they lie on the reliability boundary, not on the fire edge). `null` for `unreliable` regions
-- `gps_centroid`, `ground_area_m2` — area-weighted centroid and area of that polygon, computed on the ground (for oblique views the image-space centroid is not the ground centroid)
+- `gps_centroid`, `ground_area_m2` — area-weighted centroid and area of that polygon, computed on the ground (for oblique views the image-space centroid is not the ground centroid). The polygon is a fire zone (merged hot spots and the gaps between them)
+- `fire_area_m2` — ground area of the hot pixels inside the region (`fire_pixels_256` from `localize.py`), each pixel run projected exactly on flat ground. Only reliable pixels count; `fire_area_excluded_fraction` is the share of hot pixels left out. `null` if `localize.py` did not provide hot pixels
 - `clipped`, `removed_area_fraction` — share of the original contour that was cut off, **measured in image pixels** (the removed part's ground area is unbounded or unreliable by definition); `unreliable_vertices` counts the original contour vertices by reason (`above_horizon` / `below_min_depression` / `beyond_max_range`)
 - `touches_frame_edge` — the fire continues outside the frame
 - GeoJSON output contains `ok` and `clipped_to_reliable` regions, with `clipped` and `removed_area_fraction` in the properties
@@ -425,6 +426,8 @@ python -m tests.test_citrus_oracle    # prints the reference-code error table
           "area_px": 1823.5,
           "n_points": 14,
           "original_wh": {"width": 640, "height": 512},
+          "fire_area_px": 412,
+          "fire_pixels_256": [[88, 118, 125], [89, 116, 127], "..."],
           "gps_polygon": null,
           "fire_front_arc": null
         }
@@ -438,6 +441,7 @@ python -m tests.test_citrus_oracle    # prints the reference-code error table
 - `pixel_256` — ordered contour points in 256×256 processing space
 - `normalized` — same points in [0,1] range, resolution-agnostic. This is what `geolocate.py` consumes to back-project to GPS coordinates.
 - `original_wh` — actual thermal image dimensions at inference time, for reference
+- `fire_pixels_256`, `fire_area_px` — the hot pixels (undilated mask) inside the region, as row runs `[row, first_col, last_col]` in 256×256 space, and their count. The outline is a merged fire zone; these are the pixels actually above threshold. `geolocate.py` turns them into `fire_area_m2`
 - `gps_polygon` — null here; filled by `geolocate.py` (see [Geolocation](#6-geolocation)). `fire_front_arc` stays null
 
 **Output format options (`--output_format`):**
@@ -511,9 +515,10 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Fixed processing resolution** — both modalities are resized to 256×256. Small or distant fire regions may lose spatial detail. A multiscale inference approach could improve small-source detection.
 - **No temporal modeling** — frames are processed independently. A UAV video stream has strong temporal correlation that is currently unused.
 - **Flat-ground geolocation** — rays are intersected with a horizontal plane at the drone's altitude above ground. In hilly terrain the error grows with height error × tan(off-nadir angle) (e.g. 20 m of relief at 30° off-axis ≈ 11.5 m). A DEM can be added behind the `Terrain` interface in `geoloc/projection.py`.
-- **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning. On FLAME 3 (Sycan Marsh) this alone puts the image centre 17–19% of its range off at 10–30° depression (median 25–39 m), measured against the M30T laser rangefinder (`experiments/flame3/laser_check.py`). `--altitude_source laser` fixes it where a rangefinder exists; a DEM behind the `Terrain` interface is the general fix.
-- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against the FLAME 3 laser rangefinder, but DJI computes the laser point from the same gimbal angles, so that check confirms altitude and angle conventions, not absolute accuracy (e.g. a yaw bias). Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
-- **Polygons include the dilation buffer** — `localize.py`'s region-merging dilation enlarges every contour; `dilation_buffer_m` reports the approximate size.
+- **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning. An altitude error δh moves every point by about δh / h of its range. On FLAME 3 (Sycan Marsh) an SRTM elevation model shows the burn area is flat (a few metres of relief), so take-off altitude is a reasonable AGL there. Over hilly ground a DEM behind the `Terrain` interface is the general fix (not built yet).
+- **Laser-rangefinder height is unreliable over trees and smoke** — the laser measures the first surface it hits. On FLAME 3 only ~27% of laser readings hit the ground (within ±3 m of SRTM); most hit canopy or smoke 3–60 m higher, which makes `--altitude_source laser` heights too low. The comparison in `experiments/flame3/laser_check.py` therefore checks angle conventions, not ground accuracy.
+- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against DJI's own laser projection, which shares the gimbal angles, so absolute accuracy (e.g. a yaw bias) is untested. Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
+- **Outlines are fire zones** — `localize.py`'s region-merging dilation joins nearby hot spots into one outline, so `ground_area_m2` covers the hot spots, the gaps between them and a ~`dilation_buffer_m` margin. On FLAME 3 the hot pixels are a median ~15% of the outline. `fire_area_m2` is the ground area of the hot pixels themselves.
 - **No lever-arm or time-sync correction** — the GPS antenna is assumed to be at the camera, and metadata is assumed to be captured at the same instant as the frame.
 
 ---

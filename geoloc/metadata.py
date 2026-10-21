@@ -174,10 +174,14 @@ class ExifXmpLoader:
 
 class LaserHeightLoader(ExifXmpLoader):
     """Like ExifXmpLoader, but the height comes from the laser rangefinder when it has a
-    reading: drone altitude minus the altitude of the laser's ground point. Both come
+    reading: drone altitude minus the altitude of the laser's hit point. Both come
     from the same altimeter, so the vertical datum cancels. This is the height above
-    the ground at the laser point (the image centre). Elsewhere in the frame the
-    ground is still assumed flat at that height.
+    whatever the laser hit at the image centre. Elsewhere in the frame the ground is
+    still assumed flat at that height.
+
+    The laser measures the first surface it hits: over trees or smoke that is above
+    the ground, and the height comes out too low. On FLAME 3 (Sycan Marsh) most
+    readings hit canopy or smoke 3–60 m above the ground (checked against SRTM).
 
     Falls back to the altitude field, with its own reference, when there is no reading
     (laser distance 0 or fields absent), or when the laser ground point lies more than
