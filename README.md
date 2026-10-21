@@ -96,6 +96,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── train.py            # Training loop
 ├── evaluate.py         # Test set evaluation with confusion matrix
 ├── infer.py            # Phase 1: inference on arbitrary image pairs
+├── detect_by_temperature.py  # Phase 1 option: fire / no fire from radiometric temperatures
 ├── localize.py         # Phase 2: fire region localization (contour-based)
 ├── geolocate.py        # Phase 3: contour pixel → GPS (CLI)
 ├── visualize_geolocation.py  # draws geolocate.py results on the thermal frames
@@ -218,6 +219,24 @@ python infer.py \
 | `--output_json` | `inference_results.json` | Path to save structured results |
 | `--visualize` | off | Save 3-panel visualization figures (RGB / Thermal / confidence bars) |
 | `--vis_dir` | `inference_vis/` | Output folder for visualizations |
+
+---
+
+### 4b. Temperature-based fire detection (radiometric cameras, optional)
+
+`detect_by_temperature.py` decides fire / no fire from the measured temperatures: a frame is fire if at least `--min_hot_pixels` pixels are hotter than `--fire_temp_c`. It writes `inference_results.json` in the same format as `infer.py`, so `localize.py` runs on it unchanged. With `--classifier_json`, a frame is fire if **either** the classifier or the temperatures say so, and the classifier's output is kept.
+
+```bash
+python detect_by_temperature.py \
+  --thermal_dir custom_test/thermal \
+  --temperature_dir custom_test/temperature \
+  --classifier_json inference_results.json \
+  --output_json inference_results_combined.json
+```
+
+- Needs one float temperature image in °C per thermal frame, with the same file stem (`00001.JPG` ↔ `00001.TIFF`). 8-bit images are rejected, and a frame without a temperature image is an error, never "no fire".
+- Defaults: 80 °C, 10 pixels. Sun-heated rock, metal or engines can reach 60–70 °C, so keep the threshold above that.
+- On FLAME 3 the classifier alone missed 9 of 34 fire test frames (a camera gain mode it never saw). Combined with temperature, all 34 were detected and the 5 No Fire frames stayed clear. Over all 738 FLAME 3 frames, the temperature rule alone caught 622/622 fire frames with 0/116 false alarms.
 
 ---
 
@@ -463,6 +482,7 @@ python -m tests.test_citrus_oracle    # prints the reference-code error table
 | `train.py` | Training loop — Adam, Cross-Entropy, 15 epochs, saves `.pth` checkpoint |
 | `evaluate.py` | Test set evaluation — confusion matrix display |
 | `infer.py` | Phase 1 inference on arbitrary image pairs — outputs JSON + optional 3-panel visualizations |
+| `detect_by_temperature.py` | Phase 1 option — fire / no fire from radiometric temperatures, alone or OR-combined with `infer.py`'s output; same JSON format |
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
 | `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
 | `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: regions with GPS centroid / area / distance, ground-distance rings, reliability limit, horizon |
