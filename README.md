@@ -98,6 +98,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── infer.py            # Phase 1: inference on arbitrary image pairs
 ├── localize.py         # Phase 2: fire region localization (contour-based)
 ├── geolocate.py        # Phase 3: contour pixel → GPS (CLI)
+├── visualize_geolocation.py  # draws geolocate.py results on the thermal frames
 ├── geoloc/             # Camera-agnostic geolocation library (no rendering code)
 │   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
 │   ├── metadata.py     #   FrameMetadata + loaders (EXIF/XMP, sidecar CSV)
@@ -345,6 +346,21 @@ Rays at or above the horizon never reach the ground; rays just below it land kil
 
 Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward by roughly this distance, so GPS outlines are larger than the burning area.
 
+**Seeing the results on the image.** `visualize_geolocation.py` draws a `geolocate.py` JSON result back onto each thermal frame. Each picture shows:
+- each region, numbered, with its GPS centroid, ground area and distance from the drone
+- ground-distance rings around the drone (`--rings_m`, default 100/200/400 m)
+- the reliability limit of the run, and the horizon
+- parts clipped as unreliable, hatched
+
+It only draws, using the same camera config and the pose stored in the JSON:
+```bash
+python visualize_geolocation.py \
+  --geolocated_json geolocated_results.json \
+  --camera_config camera_configs/<your_camera>.json \
+  --thermal_dir custom_test/thermal \
+  --vis_dir geolocation_vis
+```
+
 **Running the tests** (standard library `unittest`, synthetic inputs only):
 ```bash
 python -m unittest discover -s tests -t .
@@ -445,6 +461,7 @@ python -m tests.test_citrus_oracle    # prints the reference-code error table
 | `infer.py` | Phase 1 inference on arbitrary image pairs — outputs JSON + optional 3-panel visualizations |
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
 | `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
+| `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: regions with GPS centroid / area / distance, ground-distance rings, reliability limit, horizon |
 | `geoloc/` | Geolocation library: `camera.py` (config), `metadata.py` (loaders), `projection.py` (pure geometry) |
 
 ---
