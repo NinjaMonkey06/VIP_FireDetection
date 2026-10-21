@@ -28,6 +28,7 @@ import json
 import math
 import os
 
+import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.patheffects as patheffects
@@ -37,10 +38,12 @@ from matplotlib.patches import Polygon as MplPolygon
 from PIL import Image
 
 from geoloc.camera import load_camera_config
-from geoloc.projection import (CameraPose, ReliabilityLimits, camera_to_ned, ground_to_pixels,
-                               latlon_to_offset, normalized_to_pixels, reliable_radius_m)
+from geoloc.projection import (FLAT_TERRAIN, CameraPose, ReliabilityLimits, camera_to_ned,
+                               depression_deg, ground_to_pixels, latlon_to_offset,
+                               normalized_to_pixels, pixels_to_rays_ned, reliable_radius_m)
 
 EDGE_MARGIN_PX = 50     # overlay points farther than this outside the frame are dropped
+HATCH_PX = 6            # stripe width of the "not geolocated" hatching
 OUTLINE = [patheffects.withStroke(linewidth=3, foreground="black")]
 
 
@@ -67,19 +70,35 @@ def horizon_px(intr, pose, n=200):
     return normalized_to_pixels(np.column_stack((x, -(a * x + c) / b)), intr)
 
 
+def unreliable_pixels(intr, pose, limits):
+    """(H, W) bool: pixels whose ray geolocate.py does not trust, by the same rule
+    it applies to contour vertices (above the horizon, too shallow, too far)."""
+    v, u = np.mgrid[0:intr.height, 0:intr.width] + 0.5
+    rays = pixels_to_rays_ned(np.column_stack((u.ravel(), v.ravel())), intr, pose)
+    ne = FLAT_TERRAIN.intersect(pose.altitude_agl_m, rays)
+    ground_range = np.hypot(ne[:, 0], ne[:, 1])
+    bad = np.isnan(ground_range)
+    if limits.min_depression_deg is not None:
+        bad |= depression_deg(rays) < limits.min_depression_deg
+    if limits.max_range_m is not None:
+        bad |= ground_range > limits.max_range_m
+    return bad.reshape(intr.height, intr.width)
+
+
 def latlon_to_px(lat0, lon0, latlon, intr, pose):
     north, east = latlon_to_offset(lat0, lon0, latlon[:, 0], latlon[:, 1])
     return ground_to_pixels(np.column_stack((north, east)), intr, pose)
 
 
 # ==================== Drawing ====================
-def label_ring(ax, px, text, color, W):
-    """Label a ring where it crosses closest to the vertical centre of the frame."""
-    visible = ~np.isnan(px[:, 0]) & (px[:, 0] >= 0) & (px[:, 0] <= W)
+def label_ring(ax, px, text, color, W, H, at=0.5, ha="left"):
+    """Label a ring at its visible point closest to x = at·W."""
+    visible = ~np.isnan(px[:, 0]) & (px[:, 0] >= 0) & (px[:, 0] <= W) & (px[:, 1] >= 0) & (px[:, 1] <= H)
     if not visible.any():
         return
-    i = np.flatnonzero(visible)[np.argmin(np.abs(px[visible, 0] - W / 2))]
-    ax.text(px[i, 0] + 4, px[i, 1] - 3, text, color=color, fontsize=8, path_effects=OUTLINE)
+    i = np.flatnonzero(visible)[np.argmin(np.abs(px[visible, 0] - at * W))]
+    ax.text(px[i, 0] + (4 if ha == "left" else -4), px[i, 1] - 3, text, color=color, fontsize=8,
+            ha=ha, path_effects=OUTLINE)
 
 
 def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
@@ -103,7 +122,7 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
     for r in rings_m:
         px = ground_ring_px(r, intr, pose)
         ax.plot(px[:, 0], px[:, 1], color="white", linewidth=0.8, alpha=0.8)
-        label_ring(ax, px, f"{r:g} m", "white", W)
+        label_ring(ax, px, f"{r:g} m", "white", W, H)
 
     radius = reliable_radius_m(pose.altitude_agl_m, limits)
     if radius is not None:
@@ -111,13 +130,16 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
         ax.plot(px[:, 0], px[:, 1], color="red", linewidth=1.5, linestyle="--")
         parts = [f"{limits.min_depression_deg:g}° below horizon"] if limits.min_depression_deg else []
         parts += [f"{limits.max_range_m:g} m"] if limits.max_range_m is not None else []
-        label_ring(ax, px, f"reliable limit ({', '.join(parts)}) = {radius:.0f} m", "red", W)
+        label_ring(ax, px, f"reliable limit ({', '.join(parts)}) = {radius:.0f} m", "red", W, H,
+                   at=0.98, ha="right")
     hz = horizon_px(intr, pose)
     if hz is not None:
         ax.plot(hz[:, 0], hz[:, 1], color="cyan", linewidth=1, linestyle=":")
 
     lines = []
     colors = plt.cm.Set1(np.linspace(0, 1, max(len(regions), 1)))
+    hatch = np.zeros((H, W, 4))     # "not geolocated" stripes, only where a region is unreliable
+    bad = stripes = None
     for i, (region, color) in enumerate(zip(regions, colors), start=1):
         original = np.array([[p["x"] * W, p["y"] * H] for p in region["normalized"]])
         status = region["geolocation_status"]
@@ -126,8 +148,15 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
                                 intr, pose)
             ax.add_patch(MplPolygon(kept, closed=True, facecolor=(*color[:3], 0.3),
                                     edgecolor=(*color[:3], 1.0), linewidth=2))
-        if status != "ok":    # show what was cut off (or the whole region if nothing was kept)
-            ax.add_patch(MplPolygon(original, closed=True, fill=False, hatch="///",
+        if status != "ok":    # hatch the part that was not geolocated, outline the original
+            if bad is None:
+                bad = unreliable_pixels(intr, pose, limits)
+                v, u = np.mgrid[0:H, 0:W]
+                stripes = ((u + v) // HATCH_PX) % 2 == 0
+            inside = np.zeros((H, W), np.uint8)
+            cv2.fillPoly(inside, [np.round(original).astype(np.int32)], 1)
+            hatch[(inside > 0) & bad & stripes] = (*color[:3], 0.85)
+            ax.add_patch(MplPolygon(original, closed=True, fill=False,
                                     edgecolor=(*color[:3], 0.8), linewidth=1, linestyle="--"))
 
         if region["gps_centroid"] is not None:
@@ -145,6 +174,8 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
         ax.text(cpx[0], cpx[1], f"#{i}", color="white", fontsize=10, fontweight="bold",
                 ha="center", va="center", path_effects=OUTLINE)
 
+    if bad is not None:
+        ax.imshow(hatch)
     panel.axis("off")
     panel.set_title("Fire regions (GPS centroid, distance from drone, zone and burning area)", fontsize=9)
     y = 0.97
