@@ -1,0 +1,36 @@
+{
+  "_notes": [
+    "DJI Matrice 30T thermal camera, 640x512 radiometric frames, as in the FLAME 3 CV subset (Sycan Marsh).",
+    "Intrinsics MEASURED from 54 FLAME 3 frames (experiments/flame3/measure_thermal_fov.py): each Celsius TIFF",
+    "was registered to its raw wide-camera RGB. Pixels are square (fx/fy = 0.997); fx agrees with DJI's 61 deg",
+    "diagonal FOV (696 px), not with 9.1 mm / 12 um (758 px). Frame-to-frame spread +-5 px (fx), +-2 px (cx, cy).",
+    "The values are relative to the wide camera's focal length (2775 px, from DJI's 84 deg DFOV and the 24 mm",
+    "equivalent), so they carry its ~1% uncertainty. Not checkerboard-calibrated; no distortion model.",
+    "cx, cy is the thermal pixel along the wide camera's axis, i.e. along the gimbal angles: the thermal",
+    "camera points ~1.1 deg left and ~0.8 deg up of the wide camera. The FLAME 3 'Corrected FOV' RGB crop",
+    "(x=620, y=454, 2628x2032 in the raw frame, the same in every frame) is ~3% too wide; do not use it for geometry.",
+    "Pose is NOT in the thermal files: read it from the paired raw RGB (--exif_image_dir <class>/RGB/Raw).",
+    "GimbalYawDegree is absolute (tracks FlightYawDegree within a few degrees). True vs magnetic north is unverified.",
+    "altitude_reference 'takeoff': RelativeAltitude is height above the take-off point. The laser_* fields are",
+    "used only with --altitude_source laser (height above the laser rangefinder's ground point)."
+  ],
+  "name": "DJI M30T thermal (FLAME 3)",
+  "calibration_width": 640,
+  "calibration_height": 512,
+  "fx": 697.3,
+  "fy": 697.3,
+  "cx": 334.1,
+  "cy": 266.4,
+  "dist_coeffs": [],
+  "altitude_reference": "takeoff",
+  "metadata_fields": {
+    "altitude_agl_m":          "xmp:drone-dji:RelativeAltitude",
+    "gimbal_yaw_deg":          "xmp:drone-dji:GimbalYawDegree",
+    "gimbal_pitch_deg":        "xmp:drone-dji:GimbalPitchDegree",
+    "gimbal_roll_deg":         "xmp:drone-dji:GimbalRollDegree",
+    "timestamp":               "exif:DateTimeOriginal",
+    "laser_distance_m":        "xmp:drone-dji:LRFTargetDistance",
+    "laser_drone_altitude_m":  "xmp:drone-dji:AbsoluteAltitude",
+    "laser_target_altitude_m": "xmp:drone-dji:LRFTargetAbsAlt"
+  }
+}

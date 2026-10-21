@@ -102,7 +102,8 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 │   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
 │   ├── metadata.py     #   FrameMetadata + loaders (EXIF/XMP, sidecar CSV)
 │   └── projection.py   #   Pure math: pixel → ray → ground → lat/lon
-├── camera_configs/     # dji_mini4pro.json (sample), template.json
+├── camera_configs/     # dji_m30t_thermal.json (FLAME 3), dji_mini4pro.json (sample), template.json
+├── experiments/flame3/ # thermal FOV measurement + laser-rangefinder check on FLAME 3
 ├── tests/              # unittest suite (synthetic inputs only)
 ├── docs/               # geolocation_worked_example.md (one pixel projected by hand)
 ├── THIRD_PARTY_LICENSES/
@@ -293,6 +294,8 @@ python geolocate.py \
 | `--localization_json` | required | Output of `localize.py` |
 | `--camera_config` | required | Camera JSON — see below |
 | `--metadata_csv` / `--exif_image_dir` | one required | Metadata source |
+| `--altitude_source` | `metadata` | With `--exif_image_dir`: `metadata` uses the altitude field; `laser` uses drone altitude minus the laser rangefinder's ground point where the frame has a reading, and falls back to the altitude field otherwise |
+| `--laser_max_terrain_offset_m` | `50` | Reject a laser height whose ground point lies farther than this above or below the altitude field's reference (laser hit smoke or a distant ridge) |
 | `--csv_altitude_reference` | `agl` | What the CSV altitude column is relative to: `agl` / `takeoff` / `msl` |
 | `--min_depression_deg` | `10` | Vertices whose ray is less than this many degrees below the horizon are marked unreliable. Negative = off |
 | `--max_range_m` | off | Vertices farther than this from the drone's ground position are marked unreliable |
@@ -306,6 +309,7 @@ python geolocate.py \
 - `dist_coeffs` (OpenCV order), optional `crop`, `altitude_reference`, and a `metadata_fields` mapping for the EXIF/XMP loader (`xmp:<prefix:Name>`, `exif:<TagName>` or `const:<value>`).
 - Intrinsics are rescaled to each image's resolution, but only for a plain resize: if the image's aspect ratio differs from the calibrated frame by more than rounding, it is rejected — add a `crop` entry instead.
 - `dji_mini4pro.json` is a **sample only**, ported from the reference pipeline: 82.1° **diagonal** FOV (only the diagonal reading is consistent with DJI's 24 mm-equivalent spec).
+- `dji_m30t_thermal.json` is the DJI M30T thermal camera used in the FLAME 3 dataset. Its intrinsics were measured by registering thermal frames to the wide camera (`experiments/flame3/measure_thermal_fov.py`): square pixels, fx = 697 px (matches DJI's 61° diagonal FOV), principal point off-centre at (334, 266). Pose comes from the paired raw RGB (`--exif_image_dir <class>/RGB/Raw`). See `FLAME3_GEOLOCATION_HANDOFF.md`.
 
 > **Note on this repo's sample frames:** the thermal images behind `Sample Localization Output/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
 
@@ -483,8 +487,8 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Fixed processing resolution** — both modalities are resized to 256×256. Small or distant fire regions may lose spatial detail. A multiscale inference approach could improve small-source detection.
 - **No temporal modeling** — frames are processed independently. A UAV video stream has strong temporal correlation that is currently unused.
 - **Flat-ground geolocation** — rays are intersected with a horizontal plane at the drone's altitude above ground. In hilly terrain the error grows with height error × tan(off-nadir angle) (e.g. 20 m of relief at 30° off-axis ≈ 11.5 m). A DEM can be added behind the `Terrain` interface in `geoloc/projection.py`.
-- **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning.
-- **Geolocation tested on synthetic data only** — no real per-frame metadata exists for the FLAME-2 frames used here, and the final camera is not confirmed. The math is unit-tested against hand-computed cases but has not yet been validated against surveyed ground points.
+- **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning. On FLAME 3 (Sycan Marsh) this alone puts the image centre 17–19% of its range off at 10–30° depression (median 25–39 m), measured against the M30T laser rangefinder (`experiments/flame3/laser_check.py`). `--altitude_source laser` fixes it where a rangefinder exists; a DEM behind the `Terrain` interface is the general fix.
+- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against the FLAME 3 laser rangefinder, but DJI computes the laser point from the same gimbal angles, so that check confirms altitude and angle conventions, not absolute accuracy (e.g. a yaw bias). Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
 - **Polygons include the dilation buffer** — `localize.py`'s region-merging dilation enlarges every contour; `dilation_buffer_m` reports the approximate size.
 - **No lever-arm or time-sync correction** — the GPS antenna is assumed to be at the camera, and metadata is assumed to be captured at the same instant as the frame.
 

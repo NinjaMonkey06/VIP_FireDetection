@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from geoloc.camera import camera_config_from_dict, focal_from_fov, load_camera_config
+from geoloc.metadata import LaserHeightLoader
 from geoloc.projection import CameraPose, pixels_to_ground
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "camera_configs")
@@ -90,6 +91,22 @@ class TestShippedConfigs(unittest.TestCase):
         a = pixels_to_ground(norm * [8064, 6048], c.intrinsics_for(8064, 6048), pose)
         b = pixels_to_ground(norm * [4032, 3024], c.intrinsics_for(4032, 3024), pose)
         np.testing.assert_allclose(a, b, atol=1e-9)
+
+    def test_m30t_thermal_matches_dji_diagonal_fov(self):
+        c = load_camera_config(os.path.join(CONFIG_DIR, "dji_m30t_thermal.json"))
+        k = c.intrinsics_for(640, 512)
+        self.assertEqual(k.fx, k.fy)
+        self.assertAlmostEqual(k.fx / focal_from_fov(61.0, "diagonal", 640, 512), 1.0, delta=0.01)
+        LaserHeightLoader(c)    # maps the laser fields
+
+    def test_m30t_boresight_on_flame3_frame_00001(self):
+        # FLAME 3 Fire/00001: 55.182 m above take-off, gimbal yaw 27.6°, pitch -7.1°. The
+        # principal point is the gimbal axis, so it lands h / tan(7.1°) = 443 m out along yaw.
+        c = load_camera_config(os.path.join(CONFIG_DIR, "dji_m30t_thermal.json"))
+        k = c.intrinsics_for(640, 512)
+        n, e = pixels_to_ground(np.array([[k.cx, k.cy]]), k, CameraPose(55.182, 27.6, -7.1, 0.0))[0]
+        self.assertAlmostEqual(math.hypot(n, e), 443.0, delta=0.1)
+        self.assertAlmostEqual(math.degrees(math.atan2(e, n)), 27.6, places=6)
 
     def test_template_refuses_to_load_unfilled(self):
         with self.assertRaises(ValueError):
