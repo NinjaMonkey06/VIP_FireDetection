@@ -10,7 +10,7 @@ from PIL import Image
 
 from geoloc.camera import camera_config_from_dict
 from geoloc.metadata import (
-    EXIF_IFD, GPS_IFD, ExifXmpLoader, MetadataError, MissingMetadataError,
+    EXIF_IFD, GPS_IFD, ExifXmpLoader, LaserHeightLoader, MetadataError, MissingMetadataError,
     SidecarCsvLoader, dms_to_decimal,
 )
 from geoloc.projection import CameraPose
@@ -135,6 +135,59 @@ class TestExifXmpLoader(TempDirTest):
 
     def test_dms_with_tuple_rationals(self):
         self.assertAlmostEqual(dms_to_decimal(((34, 1), (9, 1), (1800, 100)), b"N"), 34.155, places=9)
+
+
+LASER_FIELDS = {**DJI_FIELDS,
+                "laser_distance_m":        "xmp:drone-dji:LRFTargetDistance",
+                "laser_drone_altitude_m":  "xmp:drone-dji:AbsoluteAltitude",
+                "laser_target_altitude_m": "xmp:drone-dji:LRFTargetAbsAlt"}
+
+
+def laser_xmp(distance, drone_alt, target_alt, relative="+100.20"):
+    return xmp_packet({**DJI_XMP, "drone-dji:RelativeAltitude": relative,
+                       "drone-dji:LRFTargetDistance": distance,
+                       "drone-dji:AbsoluteAltitude": drone_alt,
+                       "drone-dji:LRFTargetAbsAlt": target_alt})
+
+
+class TestLaserHeightLoader(TempDirTest):
+    def load(self, xmp, **kw):
+        p = self.path("laser.jpg")
+        write_jpeg(p, xmp=xmp)
+        return LaserHeightLoader(camera(LASER_FIELDS), **kw).load("laser", p)
+
+    def test_height_above_laser_ground_point(self):
+        m = self.load(laser_xmp("250.0", "+1600.00", "+1512.30"))
+        self.assertAlmostEqual(m.altitude_agl_m, 87.7, places=9)
+        self.assertEqual(m.altitude_reference, "laser_target")
+        self.assertIsNone(m.altitude_note)
+
+    def test_no_reading_falls_back_to_altitude_field(self):
+        m = self.load(laser_xmp("0.000", "+1600.00", "0.000"))
+        self.assertEqual((m.altitude_agl_m, m.altitude_reference), (100.2, "takeoff"))
+        self.assertIn("no laser reading", m.altitude_note)
+
+    def test_absent_laser_fields_fall_back(self):
+        m = self.load(xmp_packet(DJI_XMP))
+        self.assertEqual((m.altitude_agl_m, m.altitude_reference), (100.2, "takeoff"))
+        self.assertIn("no laser fields", m.altitude_note)
+
+    def test_hit_on_nearby_smoke_rejected(self):
+        # 3 m to the target: implied height 1 m against 100 m above take-off
+        m = self.load(laser_xmp("3.1", "+1600.00", "+1599.00"))
+        self.assertEqual((m.altitude_agl_m, m.altitude_reference), (100.2, "takeoff"))
+        self.assertIn("rejected", m.altitude_note)
+
+    def test_terrain_offset_limit_is_configurable(self):
+        xmp = laser_xmp("250.0", "+1600.00", "+1560.00")      # ground 60.2 m above take-off
+        self.assertEqual(self.load(xmp).altitude_reference, "takeoff")
+        m = self.load(xmp, max_terrain_offset_m=61.0)
+        self.assertEqual((m.altitude_agl_m, m.altitude_reference), (40.0, "laser_target"))
+
+    def test_config_must_map_laser_fields(self):
+        with self.assertRaisesRegex(MetadataError, "laser_target_altitude_m"):
+            LaserHeightLoader(camera({k: v for k, v in LASER_FIELDS.items()
+                                      if k != "laser_target_altitude_m"}))
 
 
 class TestSidecarCsvLoader(TempDirTest):

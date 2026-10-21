@@ -86,7 +86,8 @@ class TestGeolocateResults(GeolocateTest):
     def test_counts(self):
         self.assertEqual(self.counts, {"frames_geolocated": 3, "frames_missing_metadata": 1,
                                        "regions_geolocated": 3, "regions_clipped_to_reliable": 1,
-                                       "regions_unreliable": 1})
+                                       "regions_unreliable": 1,
+                                       "frames_by_altitude_reference": {"agl": 3}})
 
     def test_centered_square_uses_original_resolution(self):
         # normalized 0.4..0.6 of 640x512 → ±64 px x ±51.2 px → ±20 m E x ±16 m N

@@ -35,6 +35,9 @@ Usage:
                         --camera_config camera_configs/dji_mini4pro.json \
                         --exif_image_dir custom_test/thermal
 
+    # height from the laser rangefinder where it has a reading (else the altitude field):
+    python geolocate.py ... --exif_image_dir <raw images> --altitude_source laser
+
 Assumptions: flat ground (Terrain interface for a DEM later), GPS antenna at the
 camera, metadata time-aligned with the frame, absolute gimbal angles.
 """
@@ -46,7 +49,7 @@ import os
 import numpy as np
 
 from geoloc.camera import load_camera_config
-from geoloc.metadata import ExifXmpLoader, MetadataError, SidecarCsvLoader
+from geoloc.metadata import ExifXmpLoader, LaserHeightLoader, MetadataError, SidecarCsvLoader
 from geoloc.projection import (FLAT_TERRAIN, ReliabilityLimits, ground_sample_distance_m,
                                project_contour)
 
@@ -113,7 +116,8 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
                       terrain=FLAT_TERRAIN, limits=ReliabilityLimits()) -> dict:
     """Geolocates every localized frame in place. Returns counts for the summary."""
     counts = {"frames_geolocated": 0, "frames_missing_metadata": 0, "regions_geolocated": 0,
-              "regions_clipped_to_reliable": 0, "regions_unreliable": 0}
+              "regions_clipped_to_reliable": 0, "regions_unreliable": 0,
+              "frames_by_altitude_reference": {}}
 
     for result in results:
         regions = result.get("fire_regions") or []
@@ -137,6 +141,8 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
         if meta.altitude_reference != "agl":
             warnings.append(f"altitude is relative to '{meta.altitude_reference}', used as AGL "
                             f"(assumes ground level with that reference)")
+        if meta.altitude_note:
+            warnings.append(meta.altitude_note)
         if abs(meta.gimbal_pitch_deg + 90.0) > 5.0:
             warnings.append(f"oblique view (pitch {meta.gimbal_pitch_deg}°): flat-ground errors grow off-nadir")
 
@@ -148,6 +154,7 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
             "drone": {"lat": meta.latitude_deg, "lon": meta.longitude_deg,
                       "altitude_agl_m": meta.altitude_agl_m,
                       "altitude_reference": meta.altitude_reference,
+                      "altitude_note": meta.altitude_note,
                       "gimbal_yaw_deg": meta.gimbal_yaw_deg,
                       "gimbal_pitch_deg": meta.gimbal_pitch_deg,
                       "gimbal_roll_deg": meta.gimbal_roll_deg},
@@ -161,6 +168,8 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
 
         statuses = [geolocate_region(region, camera, meta, terrain, limits) for region in regions]
         counts["frames_geolocated"] += 1
+        by_ref = counts["frames_by_altitude_reference"]
+        by_ref[meta.altitude_reference] = by_ref.get(meta.altitude_reference, 0) + 1
         counts["regions_geolocated"] += statuses.count("ok")
         counts["regions_clipped_to_reliable"] += statuses.count("clipped_to_reliable")
         counts["regions_unreliable"] += statuses.count("unreliable")
@@ -210,7 +219,14 @@ def main():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--metadata_csv",      help="Sidecar CSV, one row per frame_id")
     source.add_argument("--exif_image_dir",    help="Folder of the original images to read EXIF/XMP from")
-    parser.add_argument("--csv_altitude_reference", default="agl", choices=["agl", "takeoff", "msl"],
+    parser.add_argument("--altitude_source",   default="metadata", choices=["metadata", "laser"],
+                        help="With --exif_image_dir: 'metadata' uses the altitude field; 'laser' uses "
+                             "drone altitude minus the laser rangefinder's ground point where there "
+                             "is a reading (default: metadata)")
+    parser.add_argument("--laser_max_terrain_offset_m", type=float, default=50.0,
+                        help="Reject a laser height whose ground point is farther than this above or "
+                             "below the altitude field's reference (default: 50)")
+    parser.add_argument("--csv_altitude_reference",default="agl", choices=["agl", "takeoff", "msl"],
                         help="What the CSV altitude column is relative to (default: agl)")
     parser.add_argument("--min_depression_deg", type=float, default=10.0,
                         help="Vertices whose ray is less than this far below the horizon are marked "
@@ -224,7 +240,11 @@ def main():
 
     camera = load_camera_config(args.camera_config)
     if args.metadata_csv:
+        if args.altitude_source != "metadata":
+            parser.error("--altitude_source laser needs --exif_image_dir")
         loader = SidecarCsvLoader(args.metadata_csv, args.csv_altitude_reference)
+    elif args.altitude_source == "laser":
+        loader = LaserHeightLoader(camera, args.laser_max_terrain_offset_m)
     else:
         loader = ExifXmpLoader(camera)
 
@@ -240,6 +260,7 @@ def main():
     counts = geolocate_results(results, camera, loader, args.exif_image_dir, merge_kernel_size,
                                limits=limits)
     summary["geolocation"] = {**counts, "camera": camera.name, "terrain": "flat",
+                              "altitude_source": args.altitude_source,
                               "min_depression_deg": limits.min_depression_deg,
                               "max_range_m": limits.max_range_m}
 

@@ -27,6 +27,7 @@ from geoloc.projection import CameraPose
 GPS_IFD = 0x8825
 EXIF_IFD = 0x8769
 REQUIRED_FIELDS = ("altitude_agl_m", "gimbal_yaw_deg", "gimbal_pitch_deg", "gimbal_roll_deg")
+LASER_FIELDS = ("laser_distance_m", "laser_drone_altitude_m", "laser_target_altitude_m")
 
 
 class MetadataError(ValueError):
@@ -46,8 +47,9 @@ class FrameMetadata:
     gimbal_pitch_deg: float         # -90 = straight down
     gimbal_roll_deg: float
     timestamp: Optional[datetime]
-    altitude_reference: str         # "agl", "takeoff" or "msl" — what altitude_agl_m was read from
+    altitude_reference: str         # "agl", "takeoff", "msl" or "laser_target" — what altitude_agl_m was read from
     source: str
+    altitude_note: Optional[str] = None   # e.g. why a laser height was not used
 
     def __post_init__(self):
         if not -90.0 <= self.latitude_deg <= 90.0:
@@ -152,16 +154,63 @@ class ExifXmpLoader:
         if "timestamp" in self.fields and raw("timestamp"):
             timestamp = datetime.strptime(str(raw("timestamp")).strip(), "%Y:%m:%d %H:%M:%S")
 
+        altitude, reference, note = self.altitude(number)
         return FrameMetadata(
             latitude_deg=lat, longitude_deg=lon,
-            altitude_agl_m=number("altitude_agl_m"),
+            altitude_agl_m=altitude,
             gimbal_yaw_deg=number("gimbal_yaw_deg"),
             gimbal_pitch_deg=number("gimbal_pitch_deg"),
             gimbal_roll_deg=number("gimbal_roll_deg"),
             timestamp=timestamp,
-            altitude_reference=self.camera.altitude_reference,
+            altitude_reference=reference,
             source=f"exif:{image_path}",
+            altitude_note=note,
         )
+
+    def altitude(self, number):
+        """(altitude_m, altitude_reference, note) for one frame; `number(name)` reads a field."""
+        return number("altitude_agl_m"), self.camera.altitude_reference, None
+
+
+class LaserHeightLoader(ExifXmpLoader):
+    """Like ExifXmpLoader, but the height comes from the laser rangefinder when it has a
+    reading: drone altitude minus the altitude of the laser's ground point. Both come
+    from the same altimeter, so the vertical datum cancels. This is the height above
+    the ground at the laser point (the image centre). Elsewhere in the frame the
+    ground is still assumed flat at that height.
+
+    Falls back to the altitude field, with its own reference, when there is no reading
+    (laser distance 0 or fields absent), or when the laser ground point lies more than
+    max_terrain_offset_m above or below the altitude field's reference. The laser can
+    report a hit on smoke a few metres away, or on a distant ridge. The reason for a
+    fallback is in FrameMetadata.altitude_note.
+
+    A dataset convenience: the final drone may have no rangefinder, and a terrain model
+    (behind the Terrain interface) is the general fix."""
+
+    def __init__(self, camera: CameraConfig, max_terrain_offset_m: float = 50.0):
+        super().__init__(camera)
+        missing = [name for name in LASER_FIELDS if name not in self.fields]
+        if missing:
+            raise MetadataError(f"{camera.name}: metadata_fields has no entry for {missing}, "
+                                f"needed for laser heights")
+        self.max_terrain_offset_m = max_terrain_offset_m
+
+    def altitude(self, number):
+        fallback, reference, _ = super().altitude(number)
+        try:
+            distance, drone, target = (number(name) for name in LASER_FIELDS)
+        except MissingMetadataError:
+            return fallback, reference, "no laser fields; used the altitude field"
+        if distance <= 0.0:
+            return fallback, reference, "no laser reading; used the altitude field"
+        height = round(drone - target, 3)  # DJI writes altitudes to the millimetre
+        offset = fallback - height    # laser ground point relative to the altitude reference
+        if height <= 0.0 or abs(offset) > self.max_terrain_offset_m:
+            return fallback, reference, (f"laser height {height:.1f} m rejected: ground point "
+                                         f"{offset:+.1f} m from '{reference}' exceeds "
+                                         f"±{self.max_terrain_offset_m:g} m; used the altitude field")
+        return height, "laser_target", None
 
 
 # ==================== Sidecar CSV ====================
