@@ -105,7 +105,14 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── camera_configs/     # dji_m30t_thermal.json (FLAME 3), dji_mini4pro.json (sample), template.json
 ├── experiments/flame3/ # thermal FOV measurement + laser-rangefinder check on FLAME 3
 ├── tests/              # unittest suite (synthetic inputs only)
-├── docs/               # geolocation_worked_example.md (one pixel projected by hand)
+├── docs/               # geolocation_worked_example.md (one pixel projected by hand),
+│                       # FLAME3_GEOLOCATION_HANDOFF.md (real-data test plan and results)
+├── results/            # One subfolder per test run (outputs, figures)
+│   ├── flame2_sample/        # 16 FLAME 2 frames: inference + localization outputs, panels
+│   └── flame2_sample_early/  # earlier 7-frame FLAME 2 localization output
+├── data/               # Datasets, git-ignored (download separately)
+│   ├── flame3/         #   FLAME 3 CV subset (Sycan Marsh): Fire/, No Fire/
+│   └── flame3_test/    #   39-frame test subset (34 Fire, 5 No Fire), same layout
 ├── THIRD_PARTY_LICENSES/
 │
 ├── dataset_processed/  # Output of preprocessing (aligned 256×256 pairs)
@@ -309,9 +316,9 @@ python geolocate.py \
 - `dist_coeffs` (OpenCV order), optional `crop`, `altitude_reference`, and a `metadata_fields` mapping for the EXIF/XMP loader (`xmp:<prefix:Name>`, `exif:<TagName>` or `const:<value>`).
 - Intrinsics are rescaled to each image's resolution, but only for a plain resize: if the image's aspect ratio differs from the calibrated frame by more than rounding, it is rejected — add a `crop` entry instead.
 - `dji_mini4pro.json` is a **sample only**, ported from the reference pipeline: 82.1° **diagonal** FOV (only the diagonal reading is consistent with DJI's 24 mm-equivalent spec).
-- `dji_m30t_thermal.json` is the DJI M30T thermal camera used in the FLAME 3 dataset. Its intrinsics were measured by registering thermal frames to the wide camera (`experiments/flame3/measure_thermal_fov.py`): square pixels, fx = 697 px (matches DJI's 61° diagonal FOV), principal point off-centre at (334, 266). Pose comes from the paired raw RGB (`--exif_image_dir <class>/RGB/Raw`). See `FLAME3_GEOLOCATION_HANDOFF.md`.
+- `dji_m30t_thermal.json` is the DJI M30T thermal camera used in the FLAME 3 dataset. Its intrinsics were measured by registering thermal frames to the wide camera (`experiments/flame3/measure_thermal_fov.py`): square pixels, fx = 697 px (matches DJI's 61° diagonal FOV), principal point off-centre at (334, 266). Pose comes from the paired raw RGB (`--exif_image_dir <class>/RGB/Raw`). See `docs/FLAME3_GEOLOCATION_HANDOFF.md`.
 
-> **Note on this repo's sample frames:** the thermal images behind `Sample Localization Output/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
+> **Note on this repo's sample frames:** the thermal images behind `results/flame2_sample/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
 
 **Oblique views and the horizon.** A ray depressed θ below the horizon from height h lands h / tan θ away, and an attitude error dθ moves it by h · dθ / sin²θ:
 

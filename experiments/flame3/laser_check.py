@@ -16,7 +16,7 @@ The boresight pixel is independent of the focal length, so this checks altitude 
 angles, not fx.
 
 Usage:
-    python experiments/flame3/laser_check.py --dataset_root "CVSubset/FLAME 3 CV Dataset (Sycan Marsh)" \
+    python experiments/flame3/laser_check.py --dataset_root data/flame3 \
         --camera_config camera_configs/dji_m30t_thermal.json --output_csv laser_check.csv
 """
 

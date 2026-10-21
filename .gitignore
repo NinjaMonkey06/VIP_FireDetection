@@ -16,6 +16,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Datasets (downloaded separately; FLAME 3 CV subset is 7 GB)
-CVSubset/
-CVSubset.zip
+# Datasets (downloaded separately; see docs/FLAME3_GEOLOCATION_HANDOFF.md)
+data/

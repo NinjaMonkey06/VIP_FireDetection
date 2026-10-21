@@ -22,7 +22,7 @@ along the gimbal angles. Parallax between the two lenses (a few cm) is negligibl
 these ranges.
 
 Usage:
-    python experiments/flame3/measure_thermal_fov.py --dataset_root "CVSubset/FLAME 3 CV Dataset (Sycan Marsh)" \
+    python experiments/flame3/measure_thermal_fov.py --dataset_root data/flame3 \
         --step 5 --workers 6 --output_csv thermal_fov.csv
 """
 

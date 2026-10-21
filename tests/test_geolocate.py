@@ -16,7 +16,7 @@ from geoloc.metadata import FrameMetadata, SidecarCsvLoader
 from geoloc.projection import ReliabilityLimits, latlon_to_offset
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAMPLE_JSON = os.path.join(REPO, "Sample Localization Output", "localization_results.json")
+SAMPLE_JSON = os.path.join(REPO, "results", "flame2_sample", "localization_results.json")
 LAT0, LON0 = 34.15, -117.85
 
 # 640x512 thermal camera with 90° horizontal FOV → fx = fy = 320, 100 m AGL → 0.3125 m/px

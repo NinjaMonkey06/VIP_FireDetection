@@ -31,7 +31,7 @@ Pipeline in this repo (see `README.md`):
 
 ## 2. Dataset: FLAME 3, Computer-Vision subset (Sycan Marsh)
 
-- **Download:** `CVSubset.zip` (6.23 GB) from IEEE DataPort, https://ieee-dataport.org/open-access/flame-3-radiometric-thermal-uav-imagery-wildfire-management (free IEEE account). Kaggle mirror: https://www.kaggle.com/datasets/brycehopkins/flame-3-computer-vision-subset-sycan-marsh. Local copy: `CVSubset/` (git-ignored).
+- **Download:** `CVSubset.zip` (6.23 GB) from IEEE DataPort, https://ieee-dataport.org/open-access/flame-3-radiometric-thermal-uav-imagery-wildfire-management (free IEEE account). Kaggle mirror: https://www.kaggle.com/datasets/brycehopkins/flame-3-computer-vision-subset-sycan-marsh. Local copy: `data/flame3/` (git-ignored); the 39-frame test subset is `data/flame3_test/`.
 - **Later, for accuracy scoring only:** `NADIRPlots.zip` (32.59 GB) has surveyed ground control points. It was shot straight down at 122 m AGL with an **Autel EVO II Dual 640T (XT709)**, a different camera.
 - **Paper:** Hopkins et al., *FLAME 3 Dataset*, arXiv:2412.02831. Dataset DOI 10.21227/w0mz-aq48. No license is stated, so cite both.
 - **Why this one:** it's the only public dataset found with labels + paired RGB/thermal + one known camera + full per-image pose. Rejected alternatives: FLAME 2 (video, no telemetry), FireMan-UAV-RGBT (no telemetry), RGBT-3M (not released), FLAME 1 / UCAR (no metadata).
