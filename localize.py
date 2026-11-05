@@ -31,6 +31,19 @@ Changes v3 → v4 (based on supervisor feedback):
        multiplies the Otsu threshold, expanding the fire mask to capture
        dimmer fire regions. Set to 1.0 for pure Otsu.
 
+Threshold modes (--threshold_mode):
+    otsu      the default. A per-image threshold on the thermal image's brightness:
+              it splits any frame into a brighter and a darker part, fire or not, so
+              it needs a detector in front of it (infer.py or detect_by_temperature.py).
+              When the bright part fills most of the frame, the contour size filter
+              drops it, and any fire in that frame goes with it.
+    absolute  measured temperatures from a radiometric camera (--temperature_dir).
+              Hysteresis: pixels of at least --low_temp_c connected to at least
+              --min_seed_pixels pixels of at least --seed_temp_c. A frame with no
+              such pixels gives zero regions, so no detector is needed and
+              --inference_json may be left out. Dilation, contours and fire pixels
+              then run exactly as in otsu mode.
+
 Parameter history:
     v1: MSER delta=5, min_area=60,  max_area=4000, iou=0.3  → up to 44 boxes
     v2: MSER delta=3, min_area=150, max_area=6000, iou=0.2  → 2-15 boxes
@@ -48,6 +61,8 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Polygon as MplPolygon
+
+from detect_by_temperature import THERMAL_EXTS, index_temperature_files, load_temperatures
 
 PROCESS_SIZE = 256
 LABEL_DESCRIPTIONS = {
@@ -87,6 +102,24 @@ def otsu_fire_mask(gray, blur_kernel, threshold_scale=0.85):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
     return mask, int(otsu_thresh), applied_thresh
+
+
+def absolute_fire_mask(temps, seed_temp_c, low_temp_c, min_seed_pixels):
+    """
+    Fire mask at PROCESS_SIZE from temperatures in °C, by hysteresis at the camera's
+    own resolution: 8-connected pixels >= low_temp_c that contain at least
+    min_seed_pixels pixels >= seed_temp_c. A processing pixel counts as fire if at
+    least half of the image area it covers does, which keeps the fire area unbiased.
+    Returns: mask, number of seed pixels in the kept regions.
+    """
+    _, labels = cv2.connectedComponents((temps >= low_temp_c).astype(np.uint8), connectivity=8)
+    seeds = temps >= seed_temp_c
+    seeds_per_region = np.bincount(labels[seeds], minlength=int(labels.max()) + 1)
+    keep = seeds_per_region >= min_seed_pixels
+    keep[0] = False                       # label 0 is everything below low_temp_c
+    coverage = cv2.resize(keep[labels].astype(np.float32), (PROCESS_SIZE, PROCESS_SIZE),
+                          interpolation=cv2.INTER_AREA)
+    return (coverage >= 0.5).astype(np.uint8) * 255, int(seeds_per_region[keep].sum())
 
 
 def dilate_mask_for_merging(mask, kernel_size):
@@ -213,8 +246,10 @@ def visualize_localization(thermal_path, rgb_path, gray, mask, dilated_mask,
     has_rgb = rgb_path is not None and os.path.exists(rgb_path)
     ncols   = 5 if has_rgb else 4
     fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+    threshold = (f"Otsu={otsu_thresh} → applied={applied_thresh}" if otsu_thresh is not None
+                 else f"seed {applied_thresh} °C")
     fig.suptitle(
-        f"{frame_id}  |  {pred_label}  |  Otsu={otsu_thresh} → applied={applied_thresh}"
+        f"{frame_id}  |  {pred_label}  |  {threshold}"
         f"  |  Regions={len(contours)}",
         fontsize=10, fontweight="bold"
     )
@@ -226,7 +261,7 @@ def visualize_localization(thermal_path, rgb_path, gray, mask, dilated_mask,
         axes[col].imshow(rgb_img); axes[col].set_title("RGB"); axes[col].axis("off"); col += 1
 
     axes[col].imshow(th_color_rgb);     axes[col].set_title("Thermal");              axes[col].axis("off"); col += 1
-    axes[col].imshow(mask, cmap="gray"); axes[col].set_title(f"Otsu (t={applied_thresh})"); axes[col].axis("off"); col += 1
+    axes[col].imshow(mask, cmap="gray"); axes[col].set_title(f"Otsu (t={applied_thresh})" if otsu_thresh is not None else "Temperature mask"); axes[col].axis("off"); col += 1
     axes[col].imshow(dilated_mask, cmap="gray"); axes[col].set_title("Dilated (merged)"); axes[col].axis("off"); col += 1
 
     axes[col].imshow(th_color_rgb)
@@ -252,7 +287,9 @@ def visualize_localization(thermal_path, rgb_path, gray, mask, dilated_mask,
 def main():
     parser = argparse.ArgumentParser(description="Phase 2: Fire Localization v4")
 
-    parser.add_argument("--inference_json",  required=True)
+    parser.add_argument("--inference_json",  default=None,
+                        help="Output of infer.py or detect_by_temperature.py. Required in otsu mode; "
+                             "without it, absolute mode runs on every image in --thermal_dir")
     parser.add_argument("--thermal_dir",     required=True)
     parser.add_argument("--rgb_dir",         default=None)
     parser.add_argument("--output_json",     default="localization_results.json")
@@ -260,7 +297,20 @@ def main():
     parser.add_argument("--visualize",       action="store_true")
     parser.add_argument("--vis_dir",         default="localization_vis")
 
-    # Thresholding
+    # Threshold mode
+    parser.add_argument("--threshold_mode",  default="otsu", choices=["otsu", "absolute"],
+                        help="otsu: per-image threshold (default). absolute: measured temperatures, "
+                             "zero regions when nothing is hot enough")
+    parser.add_argument("--temperature_dir", default=None,
+                        help="Absolute mode: radiometric temperature images (float °C), same file stems")
+    parser.add_argument("--seed_temp_c",     type=float, default=80.0,
+                        help="Absolute mode: a region needs pixels at least this hot (default: 80)")
+    parser.add_argument("--low_temp_c",      type=float, default=60.0,
+                        help="Absolute mode: a region grows into connected pixels at least this hot (default: 60)")
+    parser.add_argument("--min_seed_pixels", type=int,   default=10,
+                        help="Absolute mode: seed pixels a region needs, at camera resolution (default: 10)")
+
+    # Thresholding (otsu mode)
     parser.add_argument("--otsu_blur_kernel",  type=int,   default=5,
                         help="Gaussian blur kernel before Otsu (default: 5, set 1 to disable)")
     parser.add_argument("--threshold_scale",   type=float, default=0.85,
@@ -283,14 +333,37 @@ def main():
 
     args = parser.parse_args()
 
-    with open(args.inference_json) as f:
-        inference_data = json.load(f)
+    absolute = args.threshold_mode == "absolute"
+    if absolute and not args.temperature_dir:
+        parser.error("--threshold_mode absolute needs --temperature_dir")
+    if absolute and args.low_temp_c > args.seed_temp_c:
+        parser.error("--low_temp_c cannot be above --seed_temp_c")
+    if not absolute and not args.inference_json:
+        parser.error("otsu mode needs --inference_json: it splits any frame into brighter and darker parts, "
+                     "fire or not")
+
+    if args.inference_json:
+        with open(args.inference_json) as f:
+            inference_data = json.load(f)
+    else:
+        filenames = sorted(f for f in os.listdir(args.thermal_dir)
+                           if os.path.splitext(f)[1].lower() in THERMAL_EXTS)
+        inference_data = {"summary": {"total_frames": len(filenames), "source": "thermal_dir"},
+                          "results": [{"frame_id": os.path.splitext(f)[0], "filename": f, "fire_detected": True,
+                                       "classifier_prediction": "none"} for f in filenames]}
 
     results      = inference_data["results"]
     fire_frames  = [r for r in results if r["fire_detected"]]
     clear_frames = [r for r in results if not r["fire_detected"]]
 
     print(f"[✓] Loaded {len(results)} frames — Fire: {len(fire_frames)}  Clear: {len(clear_frames)}\n")
+
+    if absolute:
+        temperature_files = index_temperature_files(args.temperature_dir)
+        missing = [r["filename"] for r in fire_frames
+                   if os.path.splitext(r["filename"])[0] not in temperature_files]
+        if missing:     # a missing reading is never treated as "no fire"
+            parser.error(f"no temperature image for {len(missing)} frame(s), e.g. {missing[:3]}")
 
     localized_count = 0
     no_region_count = 0
@@ -312,7 +385,15 @@ def main():
             continue
 
         gray, original_size = load_thermal_gray(thermal_path)
-        mask, otsu_thresh, applied_thresh = otsu_fire_mask(gray, args.otsu_blur_kernel, args.threshold_scale)
+        if absolute:
+            temps = load_temperatures(temperature_files[os.path.splitext(filename)[0]])
+            mask, seed_pixels = absolute_fire_mask(temps, args.seed_temp_c, args.low_temp_c, args.min_seed_pixels)
+            otsu_thresh, applied_thresh = None, args.seed_temp_c
+            threshold_fields = {"threshold_mode": "absolute", "seed_pixels": seed_pixels}
+        else:
+            mask, otsu_thresh, applied_thresh = otsu_fire_mask(gray, args.otsu_blur_kernel, args.threshold_scale)
+            threshold_fields = {"otsu_threshold": otsu_thresh, "applied_threshold": applied_thresh,
+                                "threshold_scale": args.threshold_scale}
         dilated_mask    = dilate_mask_for_merging(mask, args.merge_kernel_size)
         contours        = extract_contours(dilated_mask, args.min_contour_area, args.max_contour_area, args.epsilon_factor)
         encoded_regions = encode_contours(contours, original_size,
@@ -320,9 +401,7 @@ def main():
 
         result.update({
             "localization_run":  True,
-            "otsu_threshold":    otsu_thresh,
-            "applied_threshold": applied_thresh,
-            "threshold_scale":   args.threshold_scale,
+            **threshold_fields,
             "merge_kernel_size": args.merge_kernel_size,
             "n_raw_contours":    len(contours),
             "fire_regions":      encoded_regions,
@@ -336,10 +415,14 @@ def main():
         else:
             no_region_count += 1
             status = "⚠  no stable contours"
-            result["localization_note"] = "Try lowering --min_contour_area or --threshold_scale"
+            result["localization_note"] = ("No region reached the temperature and size limits" if absolute else
+                                           "Try lowering --min_contour_area or --threshold_scale")
+        if not args.inference_json:     # no detector ran, so localization decides
+            result["fire_detected"] = bool(encoded_regions)
 
+        threshold = f"seed px={seed_pixels}" if absolute else f"Otsu={otsu_thresh} applied={applied_thresh}"
         print(f"  {status:<38}  |  {filename:<28}  |  "
-              f"Otsu={otsu_thresh} applied={applied_thresh}  regions={len(contours)}")
+              f"{threshold}  regions={len(contours)}")
 
         if args.visualize:
             visualize_localization(
@@ -363,6 +446,12 @@ def main():
             "output_format":     args.output_format,
         }
     })
+    if absolute:
+        summary["parameters"].update({"threshold_mode": "absolute", "seed_temp_c": args.seed_temp_c,
+                                      "low_temp_c": args.low_temp_c, "min_seed_pixels": args.min_seed_pixels})
+    if not args.inference_json:
+        summary["fire_detected"] = localized_count
+        summary["clear_frames"] = len(results) - localized_count
 
     base = os.path.splitext(args.output_json)[0]
     if args.output_format == "json":

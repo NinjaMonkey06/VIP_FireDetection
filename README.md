@@ -286,6 +286,33 @@ python localize.py \
 | `--visualize` | off | Save 5-panel figures per frame |
 | `--vis_dir` | `localization_vis/` | Output folder for visualizations |
 
+**Absolute-temperature mode (radiometric cameras).** `--threshold_mode absolute` finds fire from measured temperatures instead of Otsu's per-image brightness threshold, which stays the default. It needs no detector: without `--inference_json` it runs on every image in `--thermal_dir`, and a frame with nothing hot enough gives zero regions.
+
+```bash
+python localize.py \
+  --threshold_mode absolute \
+  --temperature_dir custom_test/temperature \
+  --thermal_dir custom_test/thermal
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--threshold_mode` | `otsu` | `otsu` or `absolute` |
+| `--temperature_dir` | required for `absolute` | Float temperature images in °C, same file stems as the thermal images. A frame without one is an error, never "no fire" |
+| `--seed_temp_c` | `80` | A region needs pixels at least this hot |
+| `--low_temp_c` | `60` | A region grows into connected (8-neighbour) pixels at least this hot |
+| `--min_seed_pixels` | `10` | Seed pixels a region needs, counted at the camera's resolution |
+
+Dilation, contours, the size filter and `fire_pixels_256` then run exactly as in Otsu mode. The results on all 738 FLAME 3 frames, with no classifier (`experiments/flame3/run_absolute_threshold.py`):
+
+| | Otsu | Absolute (80 / 60 °C) |
+|---|---|---|
+| Fire frames with at least one region (of 622) | 517 | 621 |
+| No Fire frames with at least one region (of 116) | 24 | 0 |
+| Area at ≥ 80 °C inside the outlines | 91.7% | 98.2% |
+
+Otsu's threshold often lands low enough that the bright part fills most of the frame; the size filter then drops that one contour (105 Fire and 92 No Fire frames), and any fire in it. The hottest pixel in any No Fire frame was 47.2 °C, 33 °C below the seed, but those scenes hold no engines or sun-heated metal. The one absolute-mode miss (frame `00531`, hottest 108 °C) has its hot pixels too scattered for any region to reach 10 seed pixels.
+
 **Localization evolution — parameter presets:**
 
 | Version | Approach | Key settings | Output |
@@ -327,6 +354,7 @@ python geolocate.py \
 | `--min_depression_deg` | `10` | Vertices whose ray is less than this many degrees below the horizon are marked unreliable. Negative = off |
 | `--max_range_m` | off | Vertices farther than this from the drone's ground position are marked unreliable |
 | `--output_json` | `geolocated_results.json` | Output path (extension follows `--output_format`) |
+| `--tables_dir` | off | Also write one CSV per contour here: `<frame_id>_contour_<NN>.csv` |
 | `--output_format` | `json` | `json` (full results) or `geojson` (one Polygon per region, `[lon, lat]` order) |
 
 **Sidecar CSV columns:** `frame_id, latitude, longitude, altitude_agl_m, gimbal_yaw_deg, gimbal_pitch_deg, gimbal_roll_deg[, timestamp]` — yaw clockwise from north, pitch `-90` = straight down, timestamp ISO 8601. Every column except `timestamp` must be filled; frames with missing metadata are reported as `missing_metadata` and never projected with guessed values.
@@ -359,15 +387,17 @@ Rays at or above the horizon never reach the ground; rays just below it land kil
 - `gps_centroid`, `ground_area_m2` — area-weighted centroid and area of that polygon, computed on the ground (for oblique views the image-space centroid is not the ground centroid). The polygon is a fire zone (merged hot spots and the gaps between them)
 - `fire_area_m2` — ground area of the hot pixels inside the region (`fire_pixels_256` from `localize.py`), each pixel run projected exactly on flat ground. Only reliable pixels count; `fire_area_excluded_fraction` is the share of hot pixels left out. `null` if `localize.py` did not provide hot pixels
 - `clipped`, `removed_area_fraction` — share of the original contour that was cut off, **measured in image pixels** (the removed part's ground area is unbounded or unreliable by definition); `unreliable_vertices` counts the original contour vertices by reason (`above_horizon` / `below_min_depression` / `beyond_max_range`)
-- `touches_frame_edge` — the fire continues outside the frame
+- `touches_frame_edge` — the fire continues outside the frame. Each `gps_polygon` vertex on the image border carries `"frame_edge_vertex": true`: the view ends there, not the fire
 - GeoJSON output contains `ok` and `clipped_to_reliable` regions, with `clipped` and `removed_area_fraction` in the properties
 - Clipping assumes flat ground. With both limits disabled, a region that crosses the horizon cannot be bounded and is `unreliable`
 - `fire_front_arc` stays `null` (out of scope)
 
 Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward by roughly this distance, so GPS outlines are larger than the burning area.
 
+**Contour tables.** With `--tables_dir`, every contour gets its own CSV of geolocated border points, in the order of the border line. Columns: `frame_id, contour, point, lat, lon, ground_range_m, depression_deg, point_type`. `point_type` is `fire_edge`, `image_border` (the view ends here) or `clipped` (the reliability limit ends here). A contour with no coordinates still gets a table: blank coordinates, with `unreliable` or `missing_metadata` as `point_type`. Contour and point numbers match the pictures below.
+
 **Seeing the results on the image.** `visualize_geolocation.py` draws a `geolocate.py` JSON result back onto each thermal frame. Each picture shows:
-- each region, numbered, with its GPS centroid, ground area and distance from the drone
+- each contour, numbered, as a border line through its numbered points, with its distance range from the drone, zone area and burning area
 - ground-distance rings around the drone (`--rings_m`, default 100/200/400 m)
 - the reliability limit of the run, and the horizon
 - parts clipped as unreliable, hatched
@@ -538,7 +568,7 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning. An altitude error δh moves every point by about δh / h of its range. On FLAME 3 (Sycan Marsh) an SRTM elevation model shows the burn area is flat (a few metres of relief), so take-off altitude is a reasonable AGL there. Over hilly ground a DEM behind the `Terrain` interface is the general fix (not built yet).
 - **Laser-rangefinder height is unreliable over trees and smoke** — the laser measures the first surface it hits. On FLAME 3 only ~27% of laser readings hit the ground (within ±3 m of SRTM); most hit canopy or smoke 3–60 m higher, which makes `--altitude_source laser` heights too low. The comparison in `experiments/flame3/laser_check.py` therefore checks angle conventions, not ground accuracy.
 - **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against DJI's own laser projection, which shares the gimbal angles, so absolute accuracy (e.g. a yaw bias) is untested. Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
-- **Outlines are fire zones** — `localize.py`'s region-merging dilation joins nearby hot spots into one outline, so `ground_area_m2` covers the hot spots, the gaps between them and a ~`dilation_buffer_m` margin. On FLAME 3 the hot pixels are a median ~15% of the outline. `fire_area_m2` is the ground area of the hot pixels themselves.
+- **Outlines are fire zones** — `localize.py`'s region-merging dilation joins nearby hot spots into one outline, so `ground_area_m2` covers the hot spots, the gaps between them and a ~`dilation_buffer_m` margin. On FLAME 3 the hot pixels are a median ~15% of the outline. `fire_area_m2` is the ground area of the hot pixels themselves. Border coordinates sit outside the hot pixels by that same margin (about 7 px at 256×256, a median ~5.5 m per frame on the 34 test frames).
 - **No lever-arm or time-sync correction** — the GPS antenna is assumed to be at the camera, and metadata is assumed to be captured at the same instant as the frame.
 
 ---
