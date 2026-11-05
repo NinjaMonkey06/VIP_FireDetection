@@ -41,11 +41,15 @@ Usage:
     # height from the laser rangefinder where it has a reading (else the altitude field):
     python geolocate.py ... --exif_image_dir <raw images> --altitude_source laser
 
+    # also write one table of geolocated border points per contour:
+    python geolocate.py ... --tables_dir contour_tables
+
 Assumptions: flat ground (Terrain interface for a DEM later), GPS antenna at the
 camera, metadata time-aligned with the frame, absolute gimbal angles.
 """
 
 import argparse
+import csv
 import json
 import os
 
@@ -57,25 +61,40 @@ from geoloc.projection import (FLAT_TERRAIN, ReliabilityLimits, ground_sample_di
                                pixel_runs_ground_area, project_contour)
 
 PROCESS_SIZE = 256   # must match localize.py (pixel_256 coordinate space)
+CONTOUR_TABLE_COLUMNS = ("frame_id", "contour", "point", "lat", "lon", "ground_range_m",
+                         "depression_deg", "point_type")
+
+
+def on_frame_edge(point) -> bool:
+    edge = PROCESS_SIZE - 1
+    return point["x"] <= 0 or point["y"] <= 0 or point["x"] >= edge or point["y"] >= edge
 
 
 def touches_frame_edge(region) -> bool:
-    edge = PROCESS_SIZE - 1
-    return any(p["x"] <= 0 or p["y"] <= 0 or p["x"] >= edge or p["y"] >= edge
-               for p in region["pixel_256"])
+    return any(on_frame_edge(p) for p in region["pixel_256"])
+
+
+def polygon_frame_edge_flags(region, pc):
+    """For each polygon vertex: is it an original contour vertex on the image border?
+    Such a point is where the view ends, not where the fire ends."""
+    edge = [on_frame_edge(p) for p in region["pixel_256"]]
+    return [not clip and edge[int(np.nanargmin(np.hypot(*(pc.north_east - v).T)))]
+            for v, clip in zip(pc.polygon_north_east, pc.polygon_clip_vertex)]
 
 
 def finite_or_none(x, digits):
     return round(float(x), digits) if np.isfinite(x) else None
 
 
-def encode_vertex(lat, lon, north_east, is_clip_vertex, altitude_m):
+def encode_vertex(lat, lon, north_east, is_clip_vertex, altitude_m, is_frame_edge=False):
     ground_range = float(np.hypot(*north_east))
     vertex = {"lat": round(float(lat), 8), "lon": round(float(lon), 8),
               "ground_range_m": round(ground_range, 1),
               "depression_deg": round(float(np.degrees(np.arctan2(altitude_m, ground_range))), 2)}
     if is_clip_vertex:
         vertex["clip_vertex"] = True    # created by clipping, not a fire-contour vertex
+    if is_frame_edge:
+        vertex["frame_edge_vertex"] = True    # on the image border, not on the fire's edge
     return vertex
 
 
@@ -110,9 +129,10 @@ def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
 
     region.update({
         "gps_polygon":    None if pc.polygon_north_east is None else
-                          [encode_vertex(lat, lon, ne, clip, meta.altitude_agl_m)
-                           for (lat, lon), ne, clip in zip(pc.polygon_latlon, pc.polygon_north_east,
-                                                           pc.polygon_clip_vertex)],
+                          [encode_vertex(lat, lon, ne, clip, meta.altitude_agl_m, frame_edge)
+                           for (lat, lon), ne, clip, frame_edge in
+                           zip(pc.polygon_latlon, pc.polygon_north_east, pc.polygon_clip_vertex,
+                               polygon_frame_edge_flags(region, pc))],
         "gps_centroid":   None if pc.centroid_latlon is None else
                           {"lat": round(pc.centroid_latlon[0], 8), "lon": round(pc.centroid_latlon[1], 8)},
         "ground_area_m2": None if pc.area_m2 is None else round(pc.area_m2, 2),
@@ -195,6 +215,41 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
     return counts
 
 
+def contour_table_rows(frame_id, contour_number, region):
+    """One row per border point of a contour, in the polygon's order. point_type says what
+    the point is: fire_edge, image_border (the view ends here) or clipped (the reliability
+    limit ends here). A contour with no coordinates still gets a row per contour point,
+    with blank coordinates and its status as point_type."""
+    base = {"frame_id": frame_id, "contour": contour_number}
+    if region.get("gps_polygon") is None:
+        return [{**base, "point": i, "lat": "", "lon": "", "ground_range_m": "", "depression_deg": "",
+                 "point_type": region["geolocation_status"]}
+                for i in range(1, len(region["normalized"]) + 1)]
+    return [{**base, "point": i, "lat": v["lat"], "lon": v["lon"],
+             "ground_range_m": v["ground_range_m"], "depression_deg": v["depression_deg"],
+             "point_type": ("clipped" if v.get("clip_vertex") else
+                            "image_border" if v.get("frame_edge_vertex") else "fire_edge")}
+            for i, v in enumerate(region["gps_polygon"], start=1)]
+
+
+def write_contour_tables(results, tables_dir) -> int:
+    """Writes <frame_id>_contour_<NN>.csv per contour. NN is the contour's number in
+    visualize_geolocation.py's picture. Returns the number of tables."""
+    os.makedirs(tables_dir, exist_ok=True)
+    written = 0
+    for result in results:
+        for n, region in enumerate(result.get("fire_regions") or [], start=1):
+            if "geolocation_status" not in region:
+                continue
+            path = os.path.join(tables_dir, f"{result['frame_id']}_contour_{n:02d}.csv")
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=CONTOUR_TABLE_COLUMNS)
+                writer.writeheader()
+                writer.writerows(contour_table_rows(result["frame_id"], n, region))
+            written += 1
+    return written
+
+
 def to_geojson(results):
     """One Polygon feature per geolocated region (ok or clipped_to_reliable).
     GeoJSON order is [lon, lat]."""
@@ -252,6 +307,8 @@ def main():
                              "marked unreliable (default: off)")
     parser.add_argument("--output_json",       default="geolocated_results.json")
     parser.add_argument("--output_format",     default="json", choices=["json", "geojson"])
+    parser.add_argument("--tables_dir",        default=None,
+                        help="Also write one CSV per contour here, with the geolocated border points")
     args = parser.parse_args()
 
     camera = load_camera_config(args.camera_config)
@@ -294,6 +351,8 @@ def main():
           f"  regions ok={counts['regions_geolocated']}  clipped={counts['regions_clipped_to_reliable']}"
           f"  unreliable={counts['regions_unreliable']}")
     print(f"[✓] Saved: {out_path}  ({args.output_format})")
+    if args.tables_dir:
+        print(f"[✓] Contour tables: {write_contour_tables(results, args.tables_dir)} in {args.tables_dir}/")
 
 
 if __name__ == "__main__":

@@ -3,14 +3,15 @@ visualize_geolocation.py — Draw geolocate.py results on the thermal frames
 ==========================================================================
 Reads geolocated_results.json produced by geolocate.py and, for every
 geolocated frame, draws on the original thermal image:
-    - each fire region, numbered: the geolocated part filled, any part clipped
-      away as unreliable hatched
+    - each fire contour, numbered, as a border line through its geolocated points
+      (numbered; the numbers are the rows of geolocate.py's contour tables), any
+      part clipped away as unreliable hatched
     - ground-distance rings around the drone's ground position (default
       100 / 200 / 400 m), projected into the image
     - the reliability limit of the run (--min_depression_deg / --max_range_m of
       geolocate.py) and the horizon
-A side panel lists each region's GPS centroid, distance, zone area (the outline)
-and burning area (the hot pixels), when localize.py provided them.
+A side panel lists each contour's number of border points, distance range, zone
+area (the outline) and burning area (the hot pixels), when localize.py provided them.
 
 Rendering only. The geometry comes from geoloc/ with the same camera config
 and drone pose geolocate.py used (read back from the JSON), so what is drawn
@@ -101,6 +102,16 @@ def label_ring(ax, px, text, color, W, H, at=0.5, ha="left"):
             ha=ha, path_effects=OUTLINE)
 
 
+def draw_border_points(ax, px, vertices, color):
+    """Mark and number a contour's border points; the numbers are the rows of its table."""
+    for n, ((u, v), vertex) in enumerate(zip(px, vertices), start=1):
+        marker = "x" if vertex.get("clip_vertex") else "s" if vertex.get("frame_edge_vertex") else "o"
+        ax.plot(u, v, marker=marker, color=color[:3], markersize=3, markeredgewidth=1)
+        ax.annotate(str(n), (u, v), xytext=(3, 3), textcoords="offset points", color="white", fontsize=6,
+                    path_effects=[patheffects.withStroke(linewidth=1.5, foreground="black")],
+                    annotation_clip=True)
+
+
 def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
     regions = [r for r in result.get("fire_regions") or [] if "geolocation_status" in r]
     W, H = regions[0]["original_wh"]["width"], regions[0]["original_wh"]["height"]
@@ -146,9 +157,9 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
         if region["gps_polygon"] is not None:
             kept = latlon_to_px(lat0, lon0, np.array([[v["lat"], v["lon"]] for v in region["gps_polygon"]]),
                                 intr, pose)
-            ax.add_patch(MplPolygon(kept, closed=True, facecolor=(*color[:3], 0.3),
-                                    edgecolor=(*color[:3], 1.0), linewidth=2))
-        if status != "ok":    # hatch the part that was not geolocated, outline the original
+            ax.add_patch(MplPolygon(kept, closed=True, fill=False, edgecolor=(*color[:3], 1.0), linewidth=2))
+            draw_border_points(ax, kept, region["gps_polygon"], color)
+        if status != "ok":   # hatch the part that was not geolocated, outline the original
             if bad is None:
                 bad = unreliable_pixels(intr, pose, limits)
                 v, u = np.mgrid[0:H, 0:W]
@@ -160,13 +171,13 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
                                     edgecolor=(*color[:3], 0.8), linewidth=1, linestyle="--"))
 
         if region["gps_centroid"] is not None:
-            c = region["gps_centroid"]
+            c = region["gps_centroid"]      # only places the contour's number in the picture
             cpx = latlon_to_px(lat0, lon0, np.array([[c["lat"], c["lon"]]]), intr, pose)[0]
-            north, east = latlon_to_offset(lat0, lon0, c["lat"], c["lon"])
+            ranges = [v["ground_range_m"] for v in region["gps_polygon"]]
             note = f"  [clipped {region['removed_area_fraction']:.0%}]" if region["clipped"] else ""
             burning = (f"  |  burning {region['fire_area_m2']:,.0f} m²"
                        if region.get("fire_area_m2") is not None else "")
-            lines.append((color, f"#{i}  {c['lat']:.6f}, {c['lon']:.6f}  |  {math.hypot(north, east):.0f} m away\n"
+            lines.append((color, f"#{i}  {len(ranges)} border points  |  {min(ranges):.0f}-{max(ranges):.0f} m away\n"
                                  f"     zone {region['ground_area_m2']:,.0f} m²{burning}{note}"))
         else:
             cpx = original.mean(axis=0)
@@ -177,7 +188,8 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
     if bad is not None:
         ax.imshow(hatch)
     panel.axis("off")
-    panel.set_title("Fire regions (GPS centroid, distance from drone, zone and burning area)", fontsize=9)
+    panel.set_title(f"Fire contours (coordinates: {result['frame_id']}_contour_NN.csv, one row per numbered point)",
+                    fontsize=9)
     y = 0.97
     for color, text in lines:
         panel.text(0.0, y, text, color=color[:3], fontsize=8.5, family="monospace", va="top",
@@ -185,7 +197,8 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
         y -= 0.075
     panel.text(0.0, 0.02, f"drone {lat0:.6f}, {lon0:.6f}\n"
                           f"white: ground distance from drone  |  red dashed: reliable limit\n"
-                          f"cyan dotted: horizon  |  hatched: not geolocated (unreliable)",
+                          f"cyan dotted: horizon  |  hatched: not geolocated (unreliable)\n"
+                          f"points: dot = fire edge  |  square = image border  |  x = clipped",
                fontsize=8, va="bottom", transform=panel.transAxes)
 
     plt.tight_layout()

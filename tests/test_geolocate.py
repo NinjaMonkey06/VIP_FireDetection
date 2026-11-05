@@ -82,6 +82,49 @@ class GeolocateTest(unittest.TestCase):
         return np.column_stack((n, e))
 
 
+class TestContourTables(GeolocateTest):
+    def regions(self, status):
+        return [(r["frame_id"], n, g) for r in self.data["results"]
+                for n, g in enumerate(r.get("fire_regions") or [], start=1)
+                if g.get("geolocation_status") == status]
+
+    def test_every_border_point_gets_a_row_in_polygon_order(self):
+        reg = self.by_id["nadir"]["fire_regions"][0]
+        rows = geolocate.contour_table_rows("nadir", 1, reg)
+        self.assertEqual([r["point"] for r in rows], [1, 2, 3, 4])
+        self.assertEqual([(r["lat"], r["lon"]) for r in rows], [(v["lat"], v["lon"]) for v in reg["gps_polygon"]])
+        self.assertEqual({r["point_type"] for r in rows}, {"fire_edge"})
+        self.assertEqual((rows[0]["frame_id"], rows[0]["contour"]), ("nadir", 1))
+
+    def test_points_on_the_image_border_are_labelled(self):
+        rows = geolocate.contour_table_rows("nadir", 2, self.by_id["nadir"]["fire_regions"][1])
+        self.assertEqual([r["point_type"] for r in rows], ["image_border", "fire_edge", "fire_edge", "image_border"])
+
+    def test_clipped_contour_labels_points_made_by_clipping(self):
+        frame_id, n, reg = self.regions("clipped_to_reliable")[0]
+        types = [r["point_type"] for r in geolocate.contour_table_rows(frame_id, n, reg)]
+        self.assertIn("clipped", types)
+        self.assertEqual(types.count("clipped"), sum(bool(v.get("clip_vertex")) for v in reg["gps_polygon"]))
+
+    def test_contour_without_coordinates_is_reported_not_skipped(self):
+        for status in ("unreliable", "missing_metadata"):
+            frame_id, n, reg = self.regions(status)[0]
+            rows = geolocate.contour_table_rows(frame_id, n, reg)
+            self.assertEqual(len(rows), len(reg["normalized"]))
+            self.assertEqual({r["point_type"] for r in rows}, {status})
+            self.assertEqual({r["lat"] for r in rows}, {""})
+
+    def test_one_file_per_contour(self):
+        tables = os.path.join(self._tmp.name, "tables")
+        written = geolocate.write_contour_tables(self.data["results"], tables)
+        self.assertEqual(written, 6)        # 2 nadir + 1 yawed + 1 no_meta + 2 oblique; clear frame none
+        with open(os.path.join(tables, "nadir_contour_02.csv"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertEqual(lines[0], ",".join(geolocate.CONTOUR_TABLE_COLUMNS))
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(len(os.listdir(tables)), 6)
+
+
 class TestGeolocateResults(GeolocateTest):
     def test_fire_area_from_hot_pixels(self):
         data = [frame("nadir", [SQUARE])]
