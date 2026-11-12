@@ -36,7 +36,9 @@ Threshold modes (--threshold_mode):
               it splits any frame into a brighter and a darker part, fire or not, so
               it needs a detector in front of it (infer.py or detect_by_temperature.py).
               When the bright part fills most of the frame, the contour size filter
-              drops it, and any fire in that frame goes with it.
+              would drop it and any fire in it; second-level Otsu (on by default,
+              --no_second_level_otsu turns it off) then thresholds again within the
+              bright part. Frames without that problem are unchanged.
     absolute  measured temperatures from a radiometric camera (--temperature_dir).
               Hysteresis: pixels of at least --low_temp_c connected to at least
               --min_seed_pixels pixels of at least --seed_temp_c. A frame with no
@@ -73,10 +75,33 @@ LABEL_DESCRIPTIONS = {
 
 
 def load_thermal_gray(path):
-    img = Image.open(path).convert("L")
+    return thermal_gray(Image.open(path))
+
+
+def thermal_gray(img):
+    """The PROCESS_SIZE grayscale image localization works on, and the original size,
+    from a thermal image (PIL). Video frames go through here too, so they are
+    processed exactly like still images."""
+    img = img.convert("L")
     original_size = img.size
     img_resized = img.resize((PROCESS_SIZE, PROCESS_SIZE), Image.BILINEAR)
     return np.array(img_resized, dtype=np.uint8), original_size
+
+
+def blur_for_threshold(gray, blur_kernel):
+    if blur_kernel > 1:
+        k = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
+        return cv2.GaussianBlur(gray, (k, k), 0)
+    return gray
+
+
+def threshold_mask(gray_blurred, threshold):
+    """Pixels above threshold, with 3x3 open + close to remove speckle."""
+    _, mask = cv2.threshold(gray_blurred, threshold, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return mask
 
 
 def otsu_fire_mask(gray, blur_kernel, threshold_scale=0.85):
@@ -85,23 +110,41 @@ def otsu_fire_mask(gray, blur_kernel, threshold_scale=0.85):
     threshold_scale < 1.0 lowers the threshold, capturing more fire pixels.
     Returns: mask, raw otsu value, applied threshold value.
     """
-    if blur_kernel > 1:
-        k = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
-        gray_blurred = cv2.GaussianBlur(gray, (k, k), 0)
-    else:
-        gray_blurred = gray
-
+    gray_blurred = blur_for_threshold(gray, blur_kernel)
     otsu_thresh, _ = cv2.threshold(
         gray_blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
     applied_thresh = max(1, int(otsu_thresh * threshold_scale))
-    _, mask = cv2.threshold(gray_blurred, applied_thresh, 255, cv2.THRESH_BINARY)
+    return threshold_mask(gray_blurred, applied_thresh), int(otsu_thresh), applied_thresh
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    return mask, int(otsu_thresh), applied_thresh
+def has_oversized_region(mask, merge_kernel_size, max_area):
+    """Would merging give a region larger than max_area (which extract_contours drops)?"""
+    found, _ = cv2.findContours(dilate_mask_for_merging(mask, merge_kernel_size),
+                                cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return any(cv2.contourArea(c) > max_area for c in found)
+
+
+def second_level_otsu_mask(gray, blur_kernel, threshold_scale, merge_kernel_size, max_area, max_rounds=3):
+    """
+    otsu_fire_mask, unchanged on frames where it works. When its threshold lands so
+    low that merging gives a region larger than max_area, extract_contours would drop
+    that region and any fire inside it. Instead, Otsu runs again on just the pixels
+    above the threshold, which separates fire from warm background, up to max_rounds
+    times. Returns: mask, raw otsu value, applied threshold, extra rounds used.
+    """
+    mask, otsu_thresh, applied_thresh = otsu_fire_mask(gray, blur_kernel, threshold_scale)
+    gray_blurred = blur_for_threshold(gray, blur_kernel)
+    rounds = 0
+    while rounds < max_rounds and has_oversized_region(mask, merge_kernel_size, max_area):
+        bright = gray_blurred[gray_blurred > applied_thresh]
+        if bright.size < 2 or bright.min() == bright.max():
+            break
+        t, _ = cv2.threshold(bright.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        applied_thresh = max(applied_thresh + 1, int(t * threshold_scale))
+        mask = threshold_mask(gray_blurred, applied_thresh)
+        rounds += 1
+    return mask, otsu_thresh, applied_thresh, rounds
 
 
 def absolute_fire_mask(temps, seed_temp_c, low_temp_c, min_seed_pixels):
@@ -195,6 +238,15 @@ def encode_contours(contours, original_size, fire_runs=None):
         region["fire_front_arc"] = None   # filled by geolocate.py
         encoded.append(region)
     return encoded
+
+
+def regions_from_mask(mask, original_size, merge_kernel_size, min_area, max_area, epsilon_factor):
+    """Fire mask → merged, filtered, simplified contours and their encoded regions.
+    Returns (dilated mask, contours, encoded regions)."""
+    dilated_mask = dilate_mask_for_merging(mask, merge_kernel_size)
+    contours = extract_contours(dilated_mask, min_area, max_area, epsilon_factor)
+    return dilated_mask, contours, encode_contours(contours, original_size,
+                                                   fire_pixel_runs(mask, dilated_mask, contours))
 
 
 def to_geojson(results):
@@ -313,6 +365,9 @@ def main():
     # Thresholding (otsu mode)
     parser.add_argument("--otsu_blur_kernel",  type=int,   default=5,
                         help="Gaussian blur kernel before Otsu (default: 5, set 1 to disable)")
+    parser.add_argument("--no_second_level_otsu", action="store_true",
+                        help="Drop an oversized region (and any fire in it) instead of re-thresholding "
+                             "within its bright pixels (the default)")
     parser.add_argument("--threshold_scale",   type=float, default=0.85,
                         help="Scale applied to Otsu threshold (default: 0.85). "
                              "< 1.0 expands fire mask. Set 1.0 for pure Otsu.")
@@ -391,13 +446,19 @@ def main():
             otsu_thresh, applied_thresh = None, args.seed_temp_c
             threshold_fields = {"threshold_mode": "absolute", "seed_pixels": seed_pixels}
         else:
-            mask, otsu_thresh, applied_thresh = otsu_fire_mask(gray, args.otsu_blur_kernel, args.threshold_scale)
+            if args.no_second_level_otsu:
+                mask, otsu_thresh, applied_thresh = otsu_fire_mask(gray, args.otsu_blur_kernel, args.threshold_scale)
+                rounds = 0
+            else:
+                mask, otsu_thresh, applied_thresh, rounds = second_level_otsu_mask(
+                    gray, args.otsu_blur_kernel, args.threshold_scale, args.merge_kernel_size, args.max_contour_area)
             threshold_fields = {"otsu_threshold": otsu_thresh, "applied_threshold": applied_thresh,
                                 "threshold_scale": args.threshold_scale}
-        dilated_mask    = dilate_mask_for_merging(mask, args.merge_kernel_size)
-        contours        = extract_contours(dilated_mask, args.min_contour_area, args.max_contour_area, args.epsilon_factor)
-        encoded_regions = encode_contours(contours, original_size,
-                                          fire_pixel_runs(mask, dilated_mask, contours))
+            if rounds:
+                threshold_fields["second_level_otsu_rounds"] = rounds
+        dilated_mask, contours, encoded_regions = regions_from_mask(
+            mask, original_size, args.merge_kernel_size, args.min_contour_area, args.max_contour_area,
+            args.epsilon_factor)
 
         result.update({
             "localization_run":  True,
@@ -438,6 +499,7 @@ def main():
         "fire_detected_no_regions": no_region_count,
         "parameters": {
             "otsu_blur_kernel":  args.otsu_blur_kernel,
+            "second_level_otsu": not args.no_second_level_otsu and not absolute,
             "threshold_scale":   args.threshold_scale,
             "merge_kernel_size": args.merge_kernel_size,
             "min_contour_area":  args.min_contour_area,

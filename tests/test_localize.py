@@ -102,6 +102,63 @@ class TestAbsoluteThreshold(unittest.TestCase):
         self.assertEqual(localize.absolute_fire_mask(t, 80.0, 60.0, 10)[1], 10)
 
 
+def warm_scene_with_fire():
+    """256x256: 85% warm ground (120), a dark strip (20), one small fire (250). Plain
+    Otsu splits dark vs everything else, so merging yields one region too big to keep."""
+    g = np.full((256, 256), 120, np.uint8)
+    g[:, :38] = 20
+    g[100:116, 150:166] = 250
+    return g
+
+
+class TestSecondLevelOtsu(unittest.TestCase):
+    def test_oversized_region_is_rethresholded_to_the_fire(self):
+        g = warm_scene_with_fire()
+        plain = localize.otsu_fire_mask(g, 5, 0.85)[0]
+        self.assertEqual(len(regions_of(plain)), 0)                  # dropped by the size filter
+        mask, _, applied, rounds = localize.second_level_otsu_mask(g, 5, 0.85, 15, 50000)
+        self.assertGreaterEqual(rounds, 1)
+        regions = regions_of(mask)
+        self.assertEqual(len(regions), 1)
+        x, y, w, h = cv2.boundingRect(regions[0])
+        self.assertTrue(x < 158 < x + w and y < 108 < y + h)         # around the fire
+        self.assertEqual(cv2.countNonZero(mask[:, :38]), 0)
+
+    def test_frames_without_the_problem_are_unchanged(self):
+        g = np.tile(np.linspace(10, 60, 256).astype(np.uint8), (256, 1))
+        g[100:120, 100:140] = 250
+        plain, otsu, applied = localize.otsu_fire_mask(g, 5, 0.85)
+        mask, otsu2, applied2, rounds = localize.second_level_otsu_mask(g, 5, 0.85, 15, 50000)
+        self.assertEqual(rounds, 0)
+        self.assertTrue(np.array_equal(mask, plain))
+        self.assertEqual((otsu, applied), (otsu2, applied2))
+
+
+class TestSecondLevelCommandLine(unittest.TestCase):
+    def test_on_by_default_and_can_be_switched_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            thermal = os.path.join(d, "thermal")
+            os.makedirs(thermal)
+            Image.fromarray(cv2.resize(warm_scene_with_fire(), (640, 512), interpolation=cv2.INTER_NEAREST)).save(
+                os.path.join(thermal, "f.png"))
+            with open(os.path.join(d, "inf.json"), "w") as f:
+                json.dump({"summary": {}, "results": [{"frame_id": "f", "filename": "f.png", "fire_detected": True,
+                                                        "classifier_prediction": "YN"}]}, f)
+            found = []
+            for extra in ([], ["--no_second_level_otsu"]):
+                out = os.path.join(d, "out.json")
+                proc = subprocess.run([sys.executable, os.path.join(REPO, "localize.py"), "--inference_json",
+                                       os.path.join(d, "inf.json"), "--thermal_dir", thermal, "--output_json", out,
+                                       *extra], capture_output=True, text=True, encoding="utf-8",
+                                      env={**os.environ, "PYTHONIOENCODING": "utf-8", "MPLBACKEND": "Agg"})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(out) as f:
+                    data = json.load(f)
+                found.append(len(data["results"][0]["fire_regions"]))
+                self.assertEqual(data["summary"]["parameters"]["second_level_otsu"], not extra)
+            self.assertEqual(found, [1, 0])
+
+
 class TestAbsoluteModeCommandLine(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

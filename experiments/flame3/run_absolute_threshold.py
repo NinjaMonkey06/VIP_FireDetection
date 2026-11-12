@@ -1,7 +1,8 @@
 """
 run_absolute_threshold.py — Otsu vs absolute-temperature localization on FLAME 3
 ================================================================================
-No classifier: every frame goes to localization. Measures, on all 738 frames:
+No classifier: every frame goes to localization. Otsu is measured both plain and
+with second-level Otsu (localize.py's default). Measures, on all 738 frames:
     No Fire frames   how many produce at least one region (false-alarm frames)
     Fire frames      how many produce no region (misses)
 and how much of the truly hot area (>= seed temperature) ends up inside the outlines,
@@ -126,6 +127,8 @@ def main():
                                   for t in lows},
                      "otsu_too_small": 0, "otsu_too_big": 0, "otsu_frames_only_too_big": 0,
                      "hot_cells": 0, "hot_cells_inside_otsu": 0,
+                     "second_level_frames_with_regions": 0, "second_level_regions": 0,
+                     "hot_cells_inside_second_level": 0,
                      "hottest_pixel_c": [], "frames_with_10_px_over_seed": 0} for c in CLASSES}
     subset_otsu, subset_abs = {}, {t: {} for t in lows}
     outline_iou = {t: [] for t in lows}
@@ -152,6 +155,11 @@ def main():
             hot = hot_cells(temps, args.seed_temp_c)
             c["hot_cells"] += int(np.count_nonzero(hot))
             c["hot_cells_inside_otsu"] += int(np.count_nonzero(hot & filled(otsu_contours)))
+            sl_mask = localize.second_level_otsu_mask(gray, BLUR, SCALE, MERGE, MAX_AREA)[0]
+            sl_contours, sl_regions = regions_from_mask(sl_mask, size)
+            c["second_level_frames_with_regions"] += bool(sl_regions)
+            c["second_level_regions"] += len(sl_regions)
+            c["hot_cells_inside_second_level"] += int(np.count_nonzero(hot & filled(sl_contours)))
             hottest = float(np.nanmax(temps))
             c["hottest_pixel_c"].append(hottest)
             c["frames_with_10_px_over_seed"] += int(np.count_nonzero(temps >= args.seed_temp_c)) >= args.min_seed_pixels
