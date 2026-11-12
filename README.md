@@ -20,6 +20,7 @@ A hybrid deep learning + classical computer vision pipeline for real-time wildfi
   - [4. Inference](#4-inference)
   - [5. Localization](#5-localization)
   - [6. Geolocation](#6-geolocation)
+  - [7. Video (frame by frame)](#7-video-frame-by-frame)
 - [Output Format](#output-format)
 - [Script Reference](#script-reference)
 - [Model Architecture](#model-architecture)
@@ -100,6 +101,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── localize.py         # Phase 2: fire region localization (contour-based)
 ├── geolocate.py        # Phase 3: contour pixel → GPS (CLI)
 ├── visualize_geolocation.py  # draws geolocate.py results on the thermal frames
+├── process_video.py    # localization + geolocation on a thermal video, frame by frame
 ├── geoloc/             # Camera-agnostic geolocation library (no rendering code)
 │   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
 │   ├── metadata.py     #   FrameMetadata + loaders (EXIF/XMP, sidecar CSV)
@@ -305,13 +307,13 @@ python localize.py \
 
 Dilation, contours, the size filter and `fire_pixels_256` then run exactly as in Otsu mode. The results on all 738 FLAME 3 frames, with no classifier (`experiments/flame3/run_absolute_threshold.py`):
 
-| | Otsu | Absolute (80 / 60 °C) |
-|---|---|---|
-| Fire frames with at least one region (of 622) | 517 | 621 |
-| No Fire frames with at least one region (of 116) | 24 | 0 |
-| Area at ≥ 80 °C inside the outlines | 91.7% | 98.2% |
+| | Otsu, plain | Otsu, second-level (default) | Absolute (80 / 60 °C) |
+|---|---|---|---|
+| Fire frames with at least one region (of 622) | 517 | 617 | 621 |
+| No Fire frames with at least one region (of 116) | 24 | 49 | 0 |
+| Area at ≥ 80 °C inside the outlines | 91.7% | 94.2% | 98.2% |
 
-Otsu's threshold often lands low enough that the bright part fills most of the frame; the size filter then drops that one contour (105 Fire and 92 No Fire frames), and any fire in it. The hottest pixel in any No Fire frame was 47.2 °C, 33 °C below the seed, but those scenes hold no engines or sun-heated metal. The one absolute-mode miss (frame `00531`, hottest 108 °C) has its hot pixels too scattered for any region to reach 10 seed pixels.
+**Second-level Otsu.** Otsu's threshold often lands low enough that the bright part fills most of the frame; the size filter then drops that one contour, and any fire in it (105 Fire and 92 No Fire frames). Second-level Otsu, on by default, rethresholds within the bright pixels instead (`--no_second_level_otsu` turns it off). It changes nothing on frames without that problem, and recovers 100 of the 105 fire frames. On No Fire frames it raises false regions from 24 to 49 (mostly one region covering 70–75% of the frame), but Otsu mode only localizes frames a detector has already called fire. The hottest pixel in any No Fire frame was 47.2 °C, 33 °C below the seed, but those scenes hold no engines or sun-heated metal. The one absolute-mode miss (frame `00531`, hottest 108 °C) has its hot pixels too scattered for any region to reach 10 seed pixels.
 
 **Localization evolution — parameter presets:**
 
@@ -421,6 +423,30 @@ python -m tests.test_citrus_oracle    # prints the reference-code error table
 
 ---
 
+### 7. Video (frame by frame)
+
+`process_video.py` runs localization and geolocation on a thermal video one frame at a time, the way a live stream arrives. Each frame goes through exactly the same steps as a still image. Output is one JSON of per-frame results, one contour table per contour, and optionally an annotated video with the geolocated borders drawn in.
+
+```bash
+python process_video.py \
+  --video flight.mp4 \
+  --telemetry_csv telemetry.csv \
+  --camera_config camera_configs/<your_camera>.json \
+  --csv_altitude_reference takeoff \
+  --output_dir results/my_video --annotate
+```
+
+- **Pose:** a video carries no per-frame metadata, so it comes from a telemetry CSV in the sidecar format above, one row per frame, with `frame_id` = the frame number zero-padded to `--frame_id_digits` (default 5). A frame without a row is reported as `missing_metadata` and the run continues.
+- **Localization:** plain video has no temperatures, so this uses Otsu on every frame, with no detector in front. Its parameters and the reliability limits match `localize.py` and `geolocate.py`, except that second-level Otsu is off unless `--second_level_otsu`: without a detector it also turns more fire-free frames into false alarms.
+
+**Tested on FLAME 3** (`experiments/flame3/make_video.py`, `compare_video.py`; `results/run_D_video/`): 70 fire stills from one pass and 55 No Fire stills, made into videos at one frame per still (3 s apart).
+- **Same as stills:** a lossless video gives identical contours to the stills in all 70 frames. A lossy MP4 (7x smaller) moves border points by at most 0.53 m for 90% of them.
+- **Consistent between frames:** while the drone moves 20-48 m between frames, 87% of the fire lands within 5 m of where the next frame puts it (median).
+- **Fast:** about 10 ms per frame for localization plus geolocation at 640x512.
+- **Otsu's limits carry over:** fire was localized in 61 of 70 fire frames, and 21 of 55 No Fire frames produced regions. With `--second_level_otsu`: 70 of 70 fire frames, but 31 of 55 No Fire frames, so a detector is needed before Otsu on video.
+
+---
+
 ## Output Format
 
 ### `inference_results.json`
@@ -515,7 +541,8 @@ python -m tests.test_citrus_oracle    # prints the reference-code error table
 | `detect_by_temperature.py` | Phase 1 option — fire / no fire from radiometric temperatures, alone or OR-combined with `infer.py`'s output; same JSON format |
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
 | `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
-| `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: regions with GPS centroid / area / distance, ground-distance rings, reliability limit, horizon |
+| `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: numbered border points per contour, distance, areas, ground-distance rings, reliability limit, horizon |
+| `process_video.py` | Localization + geolocation on a thermal video, frame by frame, with pose from a per-frame telemetry CSV; per-frame JSON, contour tables, optional annotated video |
 | `geoloc/` | Geolocation library: `camera.py` (config), `metadata.py` (loaders), `projection.py` (pure geometry) |
 
 ---
