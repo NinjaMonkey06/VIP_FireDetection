@@ -13,7 +13,7 @@ import numpy as np
 import geolocate
 from geoloc.camera import camera_config_from_dict
 from geoloc.metadata import FrameMetadata, SidecarCsvLoader
-from geoloc.projection import ReliabilityLimits, latlon_to_offset
+from geoloc.projection import ReliabilityLimits, latlon_to_offset, latlon_to_px, pixels_to_ground
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE_JSON = os.path.join(REPO, "results", "flame2_sample", "localization_results.json")
@@ -244,6 +244,44 @@ class TestGeolocateResults(GeolocateTest):
         self.assertAlmostEqual(g["dilation_buffer_m"], 7 * 2.5 * 0.3125, places=2)   # 5.47 m
         self.assertEqual(g["timestamp"], "2026-10-06T12:00:00")
         self.assertEqual(g["warnings"], [])
+
+    def test_each_region_reports_its_own_dilation_margin(self):
+        # Straight down: 7 px at 256 is 17.5 px across and 14 px down the 640x512 image, at 0.3125 m/px.
+        lo, hi = self.by_id["nadir"]["fire_regions"][0]["dilation_buffer_range_m"]
+        self.assertAlmostEqual(lo, 14 * 0.3125, delta=0.01)       # 4.38 m
+        self.assertAlmostEqual(hi, 17.5 * 0.3125, delta=0.01)     # 5.47 m, the frame-level value
+        self.assertAlmostEqual(hi, self.by_id["nadir"]["geolocation"]["dilation_buffer_m"], delta=0.01)
+
+    def test_oblique_margin_is_much_longer_away_from_the_drone(self):
+        # Pitch -20°: the same 7 px cover far more ground along the view than across it, and far
+        # more than the single sideways value reported for the frame.
+        meta = FrameMetadata(LAT0, LON0, 100.0, 0.0, -20.0, 0.0, None, "agl", "stub")
+
+        class Oblique:
+            def load(self, frame_id, image_path=None):
+                return meta
+        data = [frame("oblique20", [SQUARE])]
+        geolocate.geolocate_results(data, CAMERA, Oblique(), merge_kernel_size=15)
+        reg = data[0]["fire_regions"][0]
+        self.assertEqual(reg["geolocation_status"], "ok")
+        lo, hi = reg["dilation_buffer_range_m"]
+        self.assertGreater(hi, 3.0 * lo)
+        self.assertGreater(hi, 4.0 * data[0]["geolocation"]["dilation_buffer_m"])
+        # by hand: one step of 17.5 px sideways and one of 14 px up the image, from the region's centroid
+        intr = CAMERA.intrinsics_for(640, 512)
+        centre = latlon_to_px(LAT0, LON0, np.array([[reg["gps_centroid"]["lat"], reg["gps_centroid"]["lon"]]]),
+                              intr, meta.pose())[0]
+        ne = pixels_to_ground(np.array([centre, centre + [17.5, 0.0], centre + [0.0, -14.0]]), intr, meta.pose())
+        self.assertAlmostEqual(lo, float(np.hypot(*(ne[1] - ne[0]))), delta=0.02)
+        self.assertAlmostEqual(hi, float(np.hypot(*(ne[2] - ne[0]))), delta=0.02)
+
+    def test_dilation_margin_without_merging_or_without_a_reliable_part(self):
+        reg = region(SQUARE)                                            # merge_kernel_size defaults to 0
+        geolocate.geolocate_region(reg, CAMERA, SidecarCsvLoader(self.csv).load("nadir"))
+        self.assertEqual(reg["dilation_buffer_range_m"], [0.0, 0.0])
+        top = self.by_id["oblique"]["fire_regions"][0]                  # entirely above the horizon
+        self.assertEqual(top["geolocation_status"], "unreliable")
+        self.assertIsNone(top["dilation_buffer_range_m"])
 
     def test_clear_frame_untouched(self):
         self.assertNotIn("geolocation", self.by_id["clear"])

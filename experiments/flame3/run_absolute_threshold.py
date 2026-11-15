@@ -6,7 +6,9 @@ with second-level Otsu (localize.py's default). Measures, on all 738 frames:
     No Fire frames   how many produce at least one region (false-alarm frames)
     Fire frames      how many produce no region (misses)
 and how much of the truly hot area (>= seed temperature) ends up inside the outlines,
-including what the contour size filter throws away. On the Fire test subset, how far the absolute-mode outlines and areas move
+including what the contour size filter throws away. Second-level Otsu is also counted
+behind process_video.py's background gate (frames whose median grey level is above a
+limit are not localized), for each limit in --background_gates. On the Fire test subset, how far the absolute-mode outlines and areas move
 from Otsu's, plus the geolocation status counts. Repeated per --low_temp_c value.
 
 Writes summary.json and per_frame.csv. The hottest pixel over the No Fire frames is
@@ -20,9 +22,7 @@ Usage:
 """
 
 import argparse
-import contextlib
 import csv
-import io
 import json
 import os
 import sys
@@ -40,12 +40,12 @@ from geoloc.metadata import ExifXmpLoader                                 # noqa
 
 CLASSES = ("Fire", "No Fire")
 # localize.py's defaults
-BLUR, SCALE, MERGE, MIN_AREA, MAX_AREA, EPSILON = 5, 0.85, 15, 200, 50000, 0.01
+BLUR, SCALE, MERGE, MIN_AREA, MAX_AREA, EPSILON, MAX_EPSILON = 5, 0.85, 15, 200, 50000, 0.01, 2.0
 
 
 def regions_from_mask(mask, original_size):
     dilated = localize.dilate_mask_for_merging(mask, MERGE)
-    contours = localize.extract_contours(dilated, MIN_AREA, MAX_AREA, EPSILON)
+    contours = localize.extract_contours(dilated, MIN_AREA, MAX_AREA, EPSILON, MAX_EPSILON)
     return contours, localize.encode_contours(contours, original_size,
                                               localize.fire_pixel_runs(mask, dilated, contours))
 
@@ -89,8 +89,7 @@ def geolocate_frames(frames, camera, raw_dir):
     """frames: {frame_id: encoded regions}. Returns (status counts, {frame_id: result})."""
     results = [{"frame_id": k, "filename": k + ".JPG", "localization_run": True, "fire_regions": v}
                for k, v in frames.items()]
-    with contextlib.redirect_stdout(io.StringIO()):
-        geolocate.geolocate_results(results, camera, ExifXmpLoader(camera), raw_dir, MERGE)
+    geolocate.geolocate_results(results, camera, ExifXmpLoader(camera), raw_dir, MERGE)
     statuses = [g["geolocation_status"] for r in results for g in r["fire_regions"]]
     counts = {s: statuses.count(s) for s in ("ok", "clipped_to_reliable", "unreliable", "missing_metadata")}
     return counts, {r["frame_id"]: r for r in results}
@@ -112,9 +111,12 @@ def main():
     parser.add_argument("--seed_temp_c", type=float, default=80.0)
     parser.add_argument("--low_temps_c", default="60,50")
     parser.add_argument("--min_seed_pixels", type=int, default=10)
+    parser.add_argument("--background_gates", default="40,50,60,70,80",
+                        help="Median grey limits to try as process_video.py's --max_background_gray")
     args = parser.parse_args()
 
     lows = [float(x) for x in args.low_temps_c.split(",")]
+    gates = [float(x) for x in args.background_gates.split(",")]
     camera = load_camera_config(args.camera_config)
     subset = {os.path.splitext(f)[0] for f in os.listdir(args.test_subset_dir)
               if f.upper().endswith(".JPG")}
@@ -129,6 +131,7 @@ def main():
                      "hot_cells": 0, "hot_cells_inside_otsu": 0,
                      "second_level_frames_with_regions": 0, "second_level_regions": 0,
                      "hot_cells_inside_second_level": 0,
+                     "second_level_frames_with_regions_by_background_gate": {f"{g:g}": 0 for g in gates},
                      "hottest_pixel_c": [], "frames_with_10_px_over_seed": 0} for c in CLASSES}
     subset_otsu, subset_abs = {}, {t: {} for t in lows}
     outline_iou = {t: [] for t in lows}
@@ -160,10 +163,14 @@ def main():
             c["second_level_frames_with_regions"] += bool(sl_regions)
             c["second_level_regions"] += len(sl_regions)
             c["hot_cells_inside_second_level"] += int(np.count_nonzero(hot & filled(sl_contours)))
+            background_gray = float(np.median(gray))
+            for g in gates:
+                c["second_level_frames_with_regions_by_background_gate"][f"{g:g}"] += bool(sl_regions) and background_gray <= g
             hottest = float(np.nanmax(temps))
             c["hottest_pixel_c"].append(hottest)
             c["frames_with_10_px_over_seed"] += int(np.count_nonzero(temps >= args.seed_temp_c)) >= args.min_seed_pixels
-            row = {"class": cls, "frame": stem, "hottest_c": round(hottest, 1), "otsu_regions": len(otsu_regions)}
+            row = {"class": cls, "frame": stem, "hottest_c": round(hottest, 1), "background_gray": background_gray,
+                   "otsu_regions": len(otsu_regions), "second_level_regions": len(sl_regions)}
             test_frame = cls == "Fire" and stem in subset
             if test_frame:
                 subset_otsu[stem] = otsu_regions
@@ -195,6 +202,7 @@ def main():
     summary = {"parameters": {"seed_temp_c": args.seed_temp_c, "low_temps_c": lows,
                               "min_seed_pixels": args.min_seed_pixels, "merge_kernel_size": MERGE,
                               "min_contour_area": MIN_AREA, "max_contour_area": MAX_AREA,
+                              "epsilon_factor": EPSILON, "max_epsilon_px": MAX_EPSILON,
                               "otsu_threshold_scale": SCALE},
                "classes": {}}
     for cls in CLASSES:

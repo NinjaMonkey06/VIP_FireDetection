@@ -4,7 +4,8 @@ compare_video.py — Does frame-by-frame video processing give the same, consist
 Takes process_video.py's output for a FLAME 3 test video (make_video.py) and checks:
 
 1. Video vs stills: the same frames processed from the original still JPGs (same
-   telemetry, same settings). Per frame: whether each found regions, outline IoU
+   telemetry, same settings, including second-level Otsu and the background gate
+   if the video run used them). Per frame: whether each found regions, outline IoU
    in the 256x256 processing space, and how far the video's geolocated border
    points lie from the stills' border (metres on the ground).
 2. Frame-to-frame consistency: consecutive frames see the same fire from slightly
@@ -12,7 +13,7 @@ Takes process_video.py's output for a FLAME 3 test video (make_video.py) and che
    the merged outline) are projected onto one ground grid. Within the ground both
    frames see, it reports their overlap (IoU) and agreement: the share of one
    frame's fire that lies within 2 / 5 / 10 m of the other frame's fire, averaged
-   both ways. Pairs are split by how far the drone moved between them: when it
+   both ways, and the mean distance from one frame's fire to the other's. Pairs are split by how far the drone moved between them: when it
    hovers, the pose barely changes, so only a moving drone tests the geolocation.
    Fire spread in the 2-4 s between stills and perspective (the same fire looks
    different from 100 m and 140 m away) also lower the scores.
@@ -26,9 +27,7 @@ Usage:
 """
 
 import argparse
-import contextlib
 import csv
-import io
 import json
 import os
 import sys
@@ -140,6 +139,30 @@ def raster(polys, n_max, e_min, shape):
     return m > 0
 
 
+def compare_pair(a, b, fire_a, fire_b, view_a, view_b):
+    """Two frames' fire on one ground grid, within the ground both see. Returns the pair's
+    record; it has 'iou' (and the other scores) only if there was enough to compare."""
+    allp = np.concatenate([view_a, view_b])
+    n_max, e_min = allp[:, 0].max(), allp[:, 1].min()
+    shape = (int((n_max - allp[:, 0].min()) / GRID_M) + 2, int((allp[:, 1].max() - e_min) / GRID_M) + 2)
+    shared = raster([view_a], n_max, e_min, shape) & raster([view_b], n_max, e_min, shape)
+    A = raster(list(fire_a), n_max, e_min, shape) & shared
+    B = raster(list(fire_b), n_max, e_min, shape) & shared
+    cell = GRID_M ** 2
+    rec = {"from": a["frame_id"], "to": b["frame_id"], "shared_m2": round(shared.sum() * cell),
+           "fire_a_m2": round(A.sum() * cell), "fire_b_m2": round(B.sum() * cell)}
+    if rec["shared_m2"] >= MIN_SHARED_M2 and min(rec["fire_a_m2"], rec["fire_b_m2"]) >= MIN_FIRE_M2:
+        rec["iou"] = round(float((A & B).sum() / (A | B).sum()), 3)
+        to_a = cv2.distanceTransform((~A).astype(np.uint8), cv2.DIST_L2, 5) * GRID_M
+        to_b = cv2.distanceTransform((~B).astype(np.uint8), cv2.DIST_L2, 5) * GRID_M
+        for tol in TOLERANCES_M:
+            rec[f"agreement_{tol}m"] = round(float(((to_b[A] <= tol).mean() + (to_a[B] <= tol).mean()) / 2), 3)
+        rec["distance_m"] = round(float((to_b[A].mean() + to_a[B].mean()) / 2), 2)
+        da, db = a["geolocation"]["drone"], b["geolocation"]["drone"]
+        rec["drone_moved_m"] = round(float(np.hypot(*latlon_to_offset(da["lat"], da["lon"], db["lat"], db["lon"]))), 1)
+    return rec
+
+
 def main():
     parser = argparse.ArgumentParser(description="Video vs stills, and frame-to-frame consistency")
     parser.add_argument("--dataset_root", required=True)
@@ -164,12 +187,20 @@ def main():
     stills = []
     for v in video["results"]:
         gray, size = localize.load_thermal_gray(os.path.join(thermal_dir, source[v["frame_id"]] + ".JPG"))
-        mask = localize.otsu_fire_mask(gray, p["otsu_blur_kernel"], p["threshold_scale"])[0]
-        _, _, regions = localize.regions_from_mask(mask, size, p["merge_kernel_size"], p["min_contour_area"],
-                                                   p["max_contour_area"], p["epsilon_factor"])
+        gate = p.get("max_background_gray")
+        if gate is not None and float(np.median(gray)) > gate:
+            regions = []
+        else:
+            if p.get("second_level_otsu"):
+                mask = localize.second_level_otsu_mask(gray, p["otsu_blur_kernel"], p["threshold_scale"],
+                                                       p["merge_kernel_size"], p["max_contour_area"])[0]
+            else:
+                mask = localize.otsu_fire_mask(gray, p["otsu_blur_kernel"], p["threshold_scale"])[0]
+            _, _, regions = localize.regions_from_mask(mask, size, p["merge_kernel_size"], p["min_contour_area"],
+                                                       p["max_contour_area"], p["epsilon_factor"],
+                                                       p.get("max_epsilon_px"))
         stills.append({"frame_id": v["frame_id"], "localization_run": True, "fire_regions": regions})
-    with contextlib.redirect_stdout(io.StringIO()):
-        geolocate.geolocate_results(stills, camera, loader, None, p["merge_kernel_size"], limits=limits)
+    geolocate.geolocate_results(stills, camera, loader, None, p["merge_kernel_size"], limits=limits)
 
     found = {"both": 0, "video_only": 0, "still_only": 0, "neither": 0}
     ious, border_dist, identical = [], [], 0
@@ -201,24 +232,7 @@ def main():
         fa, fb = view[a["frame_id"]], view[b["frame_id"]]
         if fa is None or fb is None:
             continue
-        allp = np.concatenate([fa, fb])
-        n_max, e_min = allp[:, 0].max(), allp[:, 1].min()
-        shape = (int((n_max - allp[:, 0].min()) / GRID_M) + 2, int((allp[:, 1].max() - e_min) / GRID_M) + 2)
-        shared = raster([fa], n_max, e_min, shape) & raster([fb], n_max, e_min, shape)
-        A = raster(list(fire[a["frame_id"]]), n_max, e_min, shape) & shared
-        B = raster(list(fire[b["frame_id"]]), n_max, e_min, shape) & shared
-        cell = GRID_M ** 2
-        rec = {"from": a["frame_id"], "to": b["frame_id"], "shared_m2": round(shared.sum() * cell),
-               "fire_a_m2": round(A.sum() * cell), "fire_b_m2": round(B.sum() * cell)}
-        if rec["shared_m2"] >= MIN_SHARED_M2 and min(rec["fire_a_m2"], rec["fire_b_m2"]) >= MIN_FIRE_M2:
-            rec["iou"] = round(float((A & B).sum() / (A | B).sum()), 3)
-            to_a = cv2.distanceTransform((~A).astype(np.uint8), cv2.DIST_L2, 5) * GRID_M
-            to_b = cv2.distanceTransform((~B).astype(np.uint8), cv2.DIST_L2, 5) * GRID_M
-            for tol in TOLERANCES_M:
-                rec[f"agreement_{tol}m"] = round(float(((to_b[A] <= tol).mean() + (to_a[B] <= tol).mean()) / 2), 3)
-            da, db = a["geolocation"]["drone"], b["geolocation"]["drone"]
-            rec["drone_moved_m"] = round(float(np.hypot(*latlon_to_offset(da["lat"], da["lon"], db["lat"], db["lon"]))), 1)
-        pairs.append(rec)
+        pairs.append(compare_pair(a, b, fire[a["frame_id"]], fire[b["frame_id"]], fa, fb))
     compared = [r for r in pairs if "iou" in r]
     consistency = {"consecutive_pairs": len(frames) - 1, "pairs_compared": len(compared),
                    "pairs_skipped_little_shared_view_or_fire": len(pairs) - len(compared)}
@@ -226,6 +240,7 @@ def main():
                         ("moving", [r for r in compared if r["drone_moved_m"] >= HOVER_M])):
         consistency[name] = {"pairs": len(group), "drone_moved_m": stats([r["drone_moved_m"] for r in group], 1),
                              "iou": stats([r["iou"] for r in group], 3),
+                             "distance_m": stats([r["distance_m"] for r in group], 2),
                              **{f"agreement_{t}m": stats([r[f"agreement_{t}m"] for r in group], 3)
                                 for t in TOLERANCES_M}}
     consistency["pairs"] = pairs

@@ -52,13 +52,14 @@ import argparse
 import csv
 import json
 import os
+import sys
 
 import numpy as np
 
 from geoloc.camera import load_camera_config
 from geoloc.metadata import ExifXmpLoader, LaserHeightLoader, MetadataError, SidecarCsvLoader
-from geoloc.projection import (FLAT_TERRAIN, ReliabilityLimits, ground_sample_distance_m,
-                               pixel_runs_ground_area, project_contour)
+from geoloc.projection import (FLAT_TERRAIN, ReliabilityLimits, ground_sample_distance_m, latlon_to_px,
+                               pixel_runs_ground_area, pixels_to_ground, project_contour)
 
 PROCESS_SIZE = 256   # must match localize.py (pixel_256 coordinate space)
 CONTOUR_TABLE_COLUMNS = ("frame_id", "contour", "point", "lat", "lon", "ground_range_m",
@@ -98,8 +99,33 @@ def encode_vertex(lat, lon, north_east, is_clip_vertex, altitude_m, is_frame_edg
     return vertex
 
 
+def dilation_buffer_range_m(pc, intr, meta, W, H, merge_kernel_size, terrain=FLAT_TERRAIN):
+    """[smallest, largest] distance on the ground by which localize.py's merge dilation
+    pushed this region's outline outside its hot pixels. In the image the dilation is
+    half the merge kernel wide in every direction. On the ground that depends on the
+    direction and on where the region is: in an oblique view it is several times longer
+    away from the drone than sideways, and longer the farther away the region lies.
+    Measured around the region's centroid. None if the region has no reliable part or
+    the measurement reaches the horizon."""
+    if pc.centroid_latlon is None:
+        return None
+    half = merge_kernel_size // 2
+    if half <= 0:
+        return [0.0, 0.0]
+    pose = meta.pose()
+    centre = latlon_to_px(meta.latitude_deg, meta.longitude_deg, np.array([pc.centroid_latlon]), intr, pose)[0]
+    angles = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+    ring = centre + np.column_stack((half * W / PROCESS_SIZE * np.cos(angles),
+                                     half * H / PROCESS_SIZE * np.sin(angles)))
+    ne = pixels_to_ground(np.vstack([centre, ring]), intr, pose, terrain)
+    distance = np.hypot(*(ne[1:] - ne[0]).T)
+    if not np.isfinite(distance).all():
+        return None
+    return [round(float(distance.min()), 2), round(float(distance.max()), 2)]
+
+
 def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
-                     limits=ReliabilityLimits()) -> str:
+                     limits=ReliabilityLimits(), merge_kernel_size=0) -> str:
     """Fills the region's GPS fields in place; returns its geolocation_status:
     'ok', 'clipped_to_reliable' or 'unreliable' (no reliable part)."""
     W, H = region["original_wh"]["width"], region["original_wh"]["height"]
@@ -138,6 +164,7 @@ def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
         "ground_area_m2": None if pc.area_m2 is None else round(pc.area_m2, 2),
         "fire_area_m2":   None if fire_area is None else round(fire_area, 2),
         "fire_area_excluded_fraction": None if fire_excluded is None else round(fire_excluded, 4),
+        "dilation_buffer_range_m": dilation_buffer_range_m(pc, intr, meta, W, H, merge_kernel_size, terrain),
         "clipped":        pc.clipped,
         "removed_area_fraction": round(pc.removed_area_fraction, 4),
         "unreliable_vertices": reasons,     # original contour vertices, by reason
@@ -148,8 +175,10 @@ def geolocate_region(region, camera, meta, terrain=FLAT_TERRAIN,
 
 
 def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size=0,
-                      terrain=FLAT_TERRAIN, limits=ReliabilityLimits()) -> dict:
-    """Geolocates every localized frame in place. Returns counts for the summary."""
+                      terrain=FLAT_TERRAIN, limits=ReliabilityLimits(), log=None) -> dict:
+    """Geolocates every localized frame in place. Returns counts for the summary.
+    log(text) gets one progress line per frame (the CLI passes print); None is silent."""
+    log = log or (lambda text: None)
     counts = {"frames_geolocated": 0, "frames_missing_metadata": 0, "regions_geolocated": 0,
               "regions_clipped_to_reliable": 0, "regions_unreliable": 0,
               "frames_by_altitude_reference": {}}
@@ -167,7 +196,7 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
             result["geolocation"] = {"status": "missing_metadata", "note": str(e)}
             for region in regions:
                 region["geolocation_status"] = "missing_metadata"
-            print(f"  [!] {result['frame_id']}: {e}")
+            log(f"  [!] {result['frame_id']}: {e}")
             continue
 
         W, H = regions[0]["original_wh"]["width"], regions[0]["original_wh"]["height"]
@@ -196,21 +225,24 @@ def geolocate_results(results, camera, loader, image_dir=None, merge_kernel_size
             # None when the image center itself does not reach the ground.
             "gsd_center_m": finite_or_none(gsd, 4),
             # localize.py dilates the mask by merge_kernel_size px at 256 scale, pushing
-            # polygons outward by about half the kernel. Approximate, at the image center.
+            # polygons outward by half the kernel. This is that distance sideways at the image
+            # center only; each region carries its own dilation_buffer_range_m, which in an
+            # oblique view is much larger away from the drone.
             "dilation_buffer_m": finite_or_none((merge_kernel_size // 2) * (W / PROCESS_SIZE) * gsd, 2),
             "warnings": warnings,
         }
 
-        statuses = [geolocate_region(region, camera, meta, terrain, limits) for region in regions]
+        statuses = [geolocate_region(region, camera, meta, terrain, limits, merge_kernel_size)
+                    for region in regions]
         counts["frames_geolocated"] += 1
         by_ref = counts["frames_by_altitude_reference"]
         by_ref[meta.altitude_reference] = by_ref.get(meta.altitude_reference, 0) + 1
         counts["regions_geolocated"] += statuses.count("ok")
         counts["regions_clipped_to_reliable"] += statuses.count("clipped_to_reliable")
         counts["regions_unreliable"] += statuses.count("unreliable")
-        print(f"  [✓] {result['frame_id']:<32} regions={len(regions)}  ok={statuses.count('ok')}"
-              f"  clipped={statuses.count('clipped_to_reliable')}"
-              f"  unreliable={statuses.count('unreliable')}  gsd={gsd:.3f} m/px")
+        log(f"  [✓] {result['frame_id']:<32} regions={len(regions)}  ok={statuses.count('ok')}"
+            f"  clipped={statuses.count('clipped_to_reliable')}"
+            f"  unreliable={statuses.count('unreliable')}  gsd={gsd:.3f} m/px")
 
     return counts
 
@@ -276,6 +308,7 @@ def to_geojson(results):
                     "touches_frame_edge":    region["touches_frame_edge"],
                     "timestamp":             result["geolocation"]["timestamp"],
                     "dilation_buffer_m":     result["geolocation"]["dilation_buffer_m"],
+                    "dilation_buffer_range_m": region.get("dilation_buffer_range_m"),
                 },
                 "geometry": {"type": "Polygon", "coordinates": [ring]},
             })
@@ -283,6 +316,8 @@ def to_geojson(results):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles default to cp1252, which cannot print ✓
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Phase 3: Fire Contour Geolocation")
     parser.add_argument("--localization_json", required=True)
     parser.add_argument("--camera_config",     required=True,
@@ -331,7 +366,7 @@ def main():
     limits = ReliabilityLimits(args.min_depression_deg if args.min_depression_deg >= 0 else None,
                                args.max_range_m)
     counts = geolocate_results(results, camera, loader, args.exif_image_dir, merge_kernel_size,
-                               limits=limits)
+                               limits=limits, log=print)
     summary["geolocation"] = {**counts, "camera": camera.name, "terrain": "flat",
                               "altitude_source": args.altitude_source,
                               "min_depression_deg": limits.min_depression_deg,

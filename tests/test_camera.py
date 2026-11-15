@@ -108,6 +108,12 @@ class TestShippedConfigs(unittest.TestCase):
         self.assertAlmostEqual(math.hypot(n, e), 443.0, delta=0.1)
         self.assertAlmostEqual(math.degrees(math.atan2(e, n)), 27.6, places=6)
 
+    def test_unknown_altitude_reference_rejected(self):
+        base = {"name": "cam", "calibration_width": 640, "calibration_height": 512, "fx": 500.0, "fy": 500.0}
+        self.assertEqual(camera_config_from_dict(base).altitude_reference, "agl")
+        with self.assertRaisesRegex(ValueError, "altitude_reference"):
+            camera_config_from_dict({**base, "altitude_reference": "AGL"})
+
     def test_template_refuses_to_load_unfilled(self):
         with self.assertRaises(ValueError):
             load_camera_config(os.path.join(CONFIG_DIR, "template.json"))

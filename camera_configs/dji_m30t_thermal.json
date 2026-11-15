@@ -10,7 +10,9 @@
     "camera points ~1.1 deg left and ~0.8 deg up of the wide camera. The FLAME 3 'Corrected FOV' RGB crop",
     "(x=620, y=454, 2628x2032 in the raw frame, the same in every frame) is ~3% too wide; do not use it for geometry.",
     "Pose is NOT in the thermal files: read it from the paired raw RGB (--exif_image_dir <class>/RGB/Raw).",
-    "GimbalYawDegree is absolute (tracks FlightYawDegree within a few degrees). True vs magnetic north is unverified.",
+    "GimbalYawDegree is absolute (tracks FlightYawDegree within a few degrees). No large yaw bias: consecutive frames",
+    "taken 43 m apart agree best with the yaw as recorded (0 to -3 deg), not with an offset the size of the magnetic",
+    "declination (experiments/flame3/pose_offset_check.py). A few degrees of bias cannot be ruled out without ground points.",
     "altitude_reference 'takeoff': RelativeAltitude is height above the take-off point. The laser_* fields are",
     "used only with --altitude_source laser (height above the laser rangefinder's ground point)."
   ],

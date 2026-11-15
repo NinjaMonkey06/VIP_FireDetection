@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from geoloc.projection import CameraPose, Intrinsics, depression_deg, pixels_to_ground, pixels_to_rays_ned
-from visualize_geolocation import ground_ring_px, horizon_px
+from visualize_geolocation import ground_ring_px, horizon_px, point_label_step
 
 INTR = Intrinsics(640, 512, 697.3, 697.3, 334.1, 266.4)
 OBLIQUE = CameraPose(80.0, 30.0, -20.0, 2.0)
@@ -32,6 +32,13 @@ class TestOverlayGeometry(unittest.TestCase):
     def test_nadir_horizon_is_outside_the_frame(self):
         px = horizon_px(INTR, CameraPose(80.0, 0.0, -90.0, 0.0))
         self.assertTrue(px is None or not ((px[:, 1] >= 0) & (px[:, 1] <= INTR.height)).any())
+
+
+class TestPointLabels(unittest.TestCase):
+    def test_short_contours_number_every_point_long_ones_every_nth(self):
+        self.assertEqual([point_label_step(n) for n in (3, 40, 41, 139, 400)], [1, 1, 2, 4, 10])
+        for n in (41, 139, 400):       # never more than about 40 numbers on one contour
+            self.assertLessEqual(len(range(0, n, point_label_step(n))), 40)
 
 
 if __name__ == "__main__":

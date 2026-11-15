@@ -10,8 +10,9 @@ geolocated frame, draws on the original thermal image:
       100 / 200 / 400 m), projected into the image
     - the reliability limit of the run (--min_depression_deg / --max_range_m of
       geolocate.py) and the horizon
-A side panel lists each contour's number of border points, distance range, zone
-area (the outline) and burning area (the hot pixels), when localize.py provided them.
+A side panel lists each contour's number of border points, distance range, margin
+(how far the merge dilation put the outline outside the hot pixels), zone area (the
+outline) and burning area (the hot pixels), when localize.py provided them.
 
 Rendering only. The geometry comes from geoloc/ with the same camera config
 and drone pose geolocate.py used (read back from the JSON), so what is drawn
@@ -28,6 +29,7 @@ import argparse
 import json
 import math
 import os
+import sys
 
 import cv2
 import matplotlib
@@ -40,10 +42,11 @@ from PIL import Image
 
 from geoloc.camera import load_camera_config
 from geoloc.projection import (FLAT_TERRAIN, CameraPose, ReliabilityLimits, camera_to_ned,
-                               depression_deg, ground_to_pixels, latlon_to_offset,
+                               depression_deg, ground_to_pixels, latlon_to_px,
                                normalized_to_pixels, pixels_to_rays_ned, reliable_radius_m)
 
 EDGE_MARGIN_PX = 50     # overlay points farther than this outside the frame are dropped
+MAX_POINT_LABELS = 40   # a contour with more border points has only every Nth one numbered
 HATCH_PX = 6            # stripe width of the "not geolocated" hatching
 OUTLINE = [patheffects.withStroke(linewidth=3, foreground="black")]
 
@@ -86,11 +89,6 @@ def unreliable_pixels(intr, pose, limits):
     return bad.reshape(intr.height, intr.width)
 
 
-def latlon_to_px(lat0, lon0, latlon, intr, pose):
-    north, east = latlon_to_offset(lat0, lon0, latlon[:, 0], latlon[:, 1])
-    return ground_to_pixels(np.column_stack((north, east)), intr, pose)
-
-
 # ==================== Drawing ====================
 def label_ring(ax, px, text, color, W, H, at=0.5, ha="left"):
     """Label a ring at its visible point closest to x = at·W."""
@@ -102,11 +100,20 @@ def label_ring(ax, px, text, color, W, H, at=0.5, ha="left"):
             ha=ha, path_effects=OUTLINE)
 
 
+def point_label_step(n_points):
+    """Number every point of a short contour, every Nth of a long one."""
+    return max(1, math.ceil(n_points / MAX_POINT_LABELS))
+
+
 def draw_border_points(ax, px, vertices, color):
-    """Mark and number a contour's border points; the numbers are the rows of its table."""
+    """Mark a contour's border points and number them; the numbers are the rows of its
+    table. Every point is marked; on a long contour only every Nth is numbered."""
+    step = point_label_step(len(vertices))
     for n, ((u, v), vertex) in enumerate(zip(px, vertices), start=1):
         marker = "x" if vertex.get("clip_vertex") else "s" if vertex.get("frame_edge_vertex") else "o"
         ax.plot(u, v, marker=marker, color=color[:3], markersize=3, markeredgewidth=1)
+        if (n - 1) % step:
+            continue
         ax.annotate(str(n), (u, v), xytext=(3, 3), textcoords="offset points", color="white", fontsize=6,
                     path_effects=[patheffects.withStroke(linewidth=1.5, foreground="black")],
                     annotation_clip=True)
@@ -177,7 +184,9 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
             note = f"  [clipped {region['removed_area_fraction']:.0%}]" if region["clipped"] else ""
             burning = (f"  |  burning {region['fire_area_m2']:,.0f} m²"
                        if region.get("fire_area_m2") is not None else "")
-            lines.append((color, f"#{i}  {len(ranges)} border points  |  {min(ranges):.0f}-{max(ranges):.0f} m away\n"
+            margin = region.get("dilation_buffer_range_m")      # absent in results from older runs
+            margin = f"  |  margin {margin[0]:.0f}-{margin[1]:.0f} m" if margin and margin[1] > 0 else ""
+            lines.append((color, f"#{i}  {len(ranges)} border points  |  {min(ranges):.0f}-{max(ranges):.0f} m away{margin}\n"
                                  f"     zone {region['ground_area_m2']:,.0f} m²{burning}{note}"))
         else:
             cpx = original.mean(axis=0)
@@ -188,7 +197,7 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
     if bad is not None:
         ax.imshow(hatch)
     panel.axis("off")
-    panel.set_title(f"Fire contours (coordinates: {result['frame_id']}_contour_NN.csv, one row per numbered point)",
+    panel.set_title(f"Fire contours (coordinates: {result['frame_id']}_contour_NN.csv, row = point number)",
                     fontsize=9)
     y = 0.97
     for color, text in lines:
@@ -198,7 +207,8 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
     panel.text(0.0, 0.02, f"drone {lat0:.6f}, {lon0:.6f}\n"
                           f"white: ground distance from drone  |  red dashed: reliable limit\n"
                           f"cyan dotted: horizon  |  hatched: not geolocated (unreliable)\n"
-                          f"points: dot = fire edge  |  square = image border  |  x = clipped",
+                          f"points: dot = fire edge  |  square = image border  |  x = clipped\n"
+                          f"margin: how far the outline lies outside the hot pixels (merge dilation)",
                fontsize=8, va="bottom", transform=panel.transAxes)
 
     plt.tight_layout()
@@ -209,6 +219,8 @@ def visualize_frame(result, camera, thermal_dir, rings_m, limits, out_dir):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles default to cp1252, which cannot print ✓
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Draw geolocation results on the thermal frames")
     parser.add_argument("--geolocated_json", required=True, help="Output of geolocate.py (json format)")
     parser.add_argument("--camera_config",   required=True, help="The camera config geolocate.py used")

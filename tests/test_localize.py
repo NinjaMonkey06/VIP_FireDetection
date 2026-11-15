@@ -55,6 +55,52 @@ class TestFirePixels(unittest.TestCase):
         self.assertIn("fire_pixels_256", regions[0])
 
 
+def outline_error_px(contour, mask):
+    """Largest distance from a pixel on the mask's true border to the simplified outline."""
+    raw, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return max(abs(cv2.pointPolygonTest(contour, (float(x), float(y)), True))
+               for c in raw for x, y in c.reshape(-1, 2))
+
+
+class TestOutline(unittest.TestCase):
+    def large_and_small(self):
+        m = np.zeros((256, 256), np.uint8)
+        cv2.ellipse(m, (128, 110), (100, 60), 20, 0, 360, 255, -1)       # perimeter ~520 px: 1% is ~5 px
+        small = np.zeros((256, 256), np.uint8)
+        cv2.circle(small, (60, 60), 12, 255, -1)                          # perimeter ~80 px: 1% is under 1 px
+        return m, small
+
+    def test_cap_keeps_a_large_outline_close_to_its_border(self):
+        large, _ = self.large_and_small()
+        plain = localize.extract_contours(large, 200, 50000, 0.01)[0]
+        capped = localize.extract_contours(large, 200, 50000, 0.01, max_epsilon_px=2.0)[0]
+        self.assertGreater(outline_error_px(plain, large), 3.0)
+        self.assertLessEqual(outline_error_px(capped, large), 2.0 + 1e-6)
+        self.assertGreater(len(capped), len(plain))
+
+    def test_cap_leaves_small_regions_unchanged_and_zero_means_no_cap(self):
+        large, small = self.large_and_small()
+        np.testing.assert_array_equal(localize.extract_contours(small, 200, 50000, 0.01)[0],
+                                      localize.extract_contours(small, 200, 50000, 0.01, max_epsilon_px=2.0)[0])
+        np.testing.assert_array_equal(localize.extract_contours(large, 200, 50000, 0.01)[0],
+                                      localize.extract_contours(large, 200, 50000, 0.01, max_epsilon_px=0)[0])
+
+    def test_normalized_points_are_pixel_centres_on_the_fire_pixel_grid(self):
+        # A rectangle of pixels, not dilated: its outline runs through the centres of its border
+        # pixels, so outline and fire-pixel cells must share one centre.
+        m = np.zeros((256, 256), np.uint8)
+        m[100:140, 60:120] = 255                       # columns 60..119, rows 100..139
+        _, contours, regions = localize.regions_from_mask(m, (640, 512), 0, 200, 50000, 0.01)
+        reg = regions[0]
+        xs = [p["x"] * 256 for p in reg["normalized"]]
+        ys = [p["y"] * 256 for p in reg["normalized"]]
+        self.assertAlmostEqual(min(xs), 60.5, places=3)
+        self.assertAlmostEqual(max(xs), 119.5, places=3)
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2, (60 + 120) / 2, places=3)      # cells cover [60, 120)
+        self.assertAlmostEqual((min(ys) + max(ys)) / 2, (100 + 140) / 2, places=3)
+        self.assertEqual(sorted({p["x"] for p in reg["pixel_256"]}), [60, 119])         # indices stay as they were
+
+
 def background(hottest_c=None):
     """640x512 temperatures: a 10-30 °C gradient, optionally with one warm patch."""
     t = np.tile(np.linspace(10.0, 30.0, 640, dtype=np.float32), (512, 1))

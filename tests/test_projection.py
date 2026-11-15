@@ -11,7 +11,7 @@ import unittest
 import numpy as np
 
 from geoloc.projection import (
-    ABOVE_HORIZON, BELOW_MIN_DEPRESSION, BEYOND_MAX_RANGE, EARTH_RADIUS_M, VERTEX_OK,
+    ABOVE_HORIZON, BELOW_MIN_DEPRESSION, BEYOND_MAX_RANGE, VERTEX_OK,
     CameraPose, Intrinsics, ReliabilityLimits, camera_to_ned, clip_polygon_disk, polygon_area,
     ground_sample_distance_m, ground_to_pixels, latlon_to_offset,
     normalized_to_pixels, offset_to_latlon, pixel_runs_ground_area, pixels_to_ground,
@@ -93,15 +93,24 @@ class TestScaling(unittest.TestCase):
 
 
 class TestLatLon(unittest.TestCase):
-    def test_100m_north_at_equator(self):
-        lat, lon = offset_to_latlon(0.0, 0.0, 100.0, 0.0)
-        self.assertAlmostEqual(float(lat), 0.000898315, places=9)
-        self.assertEqual(float(lon), 0.0)
+    def test_matches_published_wgs84_degree_lengths(self):
+        # Length of one degree on the WGS84 ellipsoid (m): latitude, longitude. A hundredth of each
+        # must come out as 0.01° (the published values are rounded to the metre: 1e-7° here).
+        for lat0, m_per_deg_lat, m_per_deg_lon in ((0.0, 110574, 111320), (45.0, 111132, 78847),
+                                                   (60.0, 111412, 55800)):
+            with self.subTest(lat0=lat0):
+                lat, lon = offset_to_latlon(lat0, 10.0, m_per_deg_lat / 100.0, m_per_deg_lon / 100.0)
+                self.assertAlmostEqual(float(lat) - lat0, 0.01, places=6)
+                self.assertAlmostEqual(float(lon) - 10.0, 0.01, places=6)
 
-    def test_longitude_scale_doubles_at_60_degrees(self):
-        _, lon_eq = offset_to_latlon(0.0, 10.0, 0.0, 100.0)
-        _, lon_60 = offset_to_latlon(60.0, 10.0, 0.0, 100.0)
-        self.assertAlmostEqual(float(lon_60 - 10.0) / float(lon_eq - 10.0), 2.0, places=9)
+    def test_a_sphere_would_be_off_by_a_metre_in_500(self):
+        # The reference's sphere of equatorial radius, at FLAME 3's latitude: 500 m north
+        # comes out 1 m short, 500 m east 0.8 m long.
+        lat, lon = offset_to_latlon(42.87, -121.13, 500.0, 500.0)
+        sphere_north = math.radians(float(lat) - 42.87) * 6378137.0
+        sphere_east = math.radians(float(lon) + 121.13) * 6378137.0 * math.cos(math.radians(42.87))
+        self.assertAlmostEqual(sphere_north - 500.0, 1.03, places=1)
+        self.assertAlmostEqual(sphere_east - 500.0, -0.78, places=1)
 
     def test_round_trip_sub_millimetre(self):
         rng = np.random.default_rng(0)
@@ -111,8 +120,6 @@ class TestLatLon(unittest.TestCase):
         np.testing.assert_allclose(n2, north, atol=1e-3)
         np.testing.assert_allclose(e2, east, atol=1e-3)
 
-    def test_earth_radius_matches_reference(self):
-        self.assertEqual(EARTH_RADIUS_M, 6378137.0)
 
 
 class TestAgainstCitrusReference(unittest.TestCase):

@@ -106,15 +106,23 @@ moves the point by about 100 · (π/180) / sin²(49.41°) ≈ 3.0 m.
 
 ## Step 8: metres → lat/lon
 
-Spherical Earth, R = 6 378 137 m:
+WGS84 ellipsoid, a = 6 378 137 m, e² = 0.00669438. The Earth curves differently
+north–south and east–west, so each direction has its own radius at lat0 = 34°:
 
 ```
-Δlat = degrees(north / R)                = degrees(53.160 / 6378137)            = 0.00047755°
-Δlon = degrees(east / (R · cos(lat0)))   = degrees(67.186 / (6378137 · 0.829038)) = 0.00072800°
+w = 1 − e² · sin²(lat0)                  = 1 − 0.00669438 · 0.312697             = 0.99790669
+M = a · (1 − e²) / w^1.5                 (north–south)                           = 6 355 384.6 m
+N = a / √w                               (east–west)                             = 6 384 823.2 m
 
-lat = 34.0      + 0.00047755 = 34.00047755
-lon = −118.0    + 0.00072800 = −117.99927200
+Δlat = degrees(north / M)                = degrees(53.160 / 6355384.6)            = 0.00047926°
+Δlon = degrees(east / (N · cos(lat0)))   = degrees(67.186 / (6384823.2 · 0.829038)) = 0.00072724°
+
+lat = 34.0      + 0.00047926 = 34.00047926
+lon = −118.0    + 0.00072724 = −117.99927276
 ```
+
+A sphere of radius a would put this point 0.19 m further south and 0.07 m further
+east; the difference grows in proportion to the distance from the drone.
 
 ## Sanity checks
 

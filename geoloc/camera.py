@@ -20,6 +20,7 @@ from typing import Dict, Optional, Tuple
 from geoloc.projection import Intrinsics
 
 FOV_TYPES = ("horizontal", "vertical", "diagonal")
+ALTITUDE_REFERENCES = ("agl", "takeoff", "msl")
 RESIZE_ROUNDING_PX = 1.0   # a pure resize can only change the aspect ratio by rounding
 
 
@@ -110,12 +111,17 @@ def camera_config_from_dict(d: dict) -> CameraConfig:
         if crop.x < 0 or crop.y < 0 or crop.x + crop.width > W or crop.y + crop.height > H:
             raise ValueError(f"{name}: crop {crop} lies outside the {W}x{H} calibrated frame")
 
+    altitude_reference = d.get("altitude_reference", "agl")
+    if altitude_reference not in ALTITUDE_REFERENCES:     # a typo would only show as an odd warning later
+        raise ValueError(f"{name}: altitude_reference must be one of {ALTITUDE_REFERENCES}, "
+                         f"got {altitude_reference!r}")
+
     return CameraConfig(
         name=name, calibration_width=W, calibration_height=H,
         fx=fx, fy=fy, cx=cx, cy=cy,
         dist_coeffs=tuple(float(c) for c in d.get("dist_coeffs") or ()),
         crop=crop,
-        altitude_reference=d.get("altitude_reference", "agl"),
+        altitude_reference=altitude_reference,
         metadata_fields=dict(d.get("metadata_fields") or {}),
     )
 

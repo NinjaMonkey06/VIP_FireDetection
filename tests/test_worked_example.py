@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from geoloc.projection import (
-    CAM_TO_GIMBAL, VERTEX_OK, CameraPose, Intrinsics, depression_deg, gimbal_to_ned,
+    CAM_TO_GIMBAL, VERTEX_OK, CameraPose, Intrinsics, depression_deg, earth_radii_m, gimbal_to_ned,
     ground_to_pixels, offset_to_latlon, pixels_to_ground, pixels_to_normalized,
     pixels_to_rays_ned, project_contour,
 )
@@ -54,9 +54,16 @@ class TestWorkedExample(unittest.TestCase):
     def test_step8_latlon(self):
         north, east = pixels_to_ground(PIXEL, INTR, POSE)[0]
         self.assertAlmostEqual(math.cos(math.radians(LAT0)), 0.829038, places=6)
+        self.assertAlmostEqual(1.0 - 0.00669438 * math.sin(math.radians(LAT0)) ** 2, 0.99790669, places=8)
+        meridional, prime_vertical = earth_radii_m(LAT0)
+        self.assertAlmostEqual(meridional, 6355384.6, places=1)
+        self.assertAlmostEqual(prime_vertical, 6384823.2, places=1)
         lat, lon = offset_to_latlon(LAT0, LON0, north, east)
-        self.assertAlmostEqual(float(lat), 34.00047755, places=8)
-        self.assertAlmostEqual(float(lon), -117.99927200, places=8)
+        self.assertAlmostEqual(float(lat), 34.00047926, places=8)
+        self.assertAlmostEqual(float(lon), -117.99927276, places=8)
+        # the sphere the reference uses: 0.19 m further south, 0.07 m further east
+        self.assertAlmostEqual(north * (1.0 - meridional / 6378137.0), 0.19, places=2)
+        self.assertAlmostEqual(east * (prime_vertical / 6378137.0 - 1.0), 0.07, places=2)
 
     def test_sanity_checks(self):
         np.testing.assert_allclose(pixels_to_ground(np.array([[320.0, 256.0]]), INTR, POSE)[0],

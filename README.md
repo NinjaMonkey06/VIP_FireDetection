@@ -92,6 +92,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 
 ```
 ├── dataset.py          # PyTorch Dataset class for paired RGB+thermal data
+├── prepare_dataset.py  # Samples and resizes raw FLAME-2 pairs into dataset_processed/
 ├── split_dataset.py    # Stratified train/val/test split with file copying
 ├── model.py            # MidFusionNet architecture definition
 ├── train.py            # Training loop
@@ -102,15 +103,15 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── geolocate.py        # Phase 3: contour pixel → GPS (CLI)
 ├── visualize_geolocation.py  # draws geolocate.py results on the thermal frames
 ├── process_video.py    # localization + geolocation on a thermal video, frame by frame
+├── srt_to_telemetry.py # per-frame telemetry CSV from a drone video's .SRT subtitle track
 ├── geoloc/             # Camera-agnostic geolocation library (no rendering code)
 │   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
 │   ├── metadata.py     #   FrameMetadata + loaders (EXIF/XMP, sidecar CSV)
 │   └── projection.py   #   Pure math: pixel → ray → ground → lat/lon
 ├── camera_configs/     # dji_m30t_thermal.json (FLAME 3), dji_mini4pro.json (sample), template.json
-├── experiments/flame3/ # thermal FOV measurement + laser-rangefinder check on FLAME 3
-├── tests/              # unittest suite (synthetic inputs only)
-├── docs/               # geolocation_worked_example.md (one pixel projected by hand),
-│                       # FLAME3_GEOLOCATION_HANDOFF.md (real-data test plan and results)
+├── experiments/flame3/ # FLAME 3 checks: thermal FOV, laser rangefinder, Otsu vs absolute, video, pose offsets
+├── tests/              # unittest suite (synthetic inputs, plus the saved results/flame2_sample output)
+├── docs/               # geolocation_worked_example.md (one pixel projected by hand), progress reports
 ├── results/            # One subfolder per test run (outputs, figures)
 │   ├── flame2_sample/        # 16 FLAME 2 frames: inference + localization outputs, panels
 │   └── flame2_sample_early/  # earlier 7-frame FLAME 2 localization output
@@ -284,6 +285,7 @@ python localize.py \
 | `--min_contour_area` | `200` | Minimum contour area in pixels at 256×256. Filters noise fragments. |
 | `--max_contour_area` | `50000` | Maximum contour area in pixels at 256×256. Prevents background capture. |
 | `--epsilon_factor` | `0.01` | `approxPolyDP` epsilon as fraction of contour perimeter. Lower = denser vertices, better arc coverage. |
+| `--max_epsilon_px` | `2` | Cap on that epsilon, in pixels at 256×256. Without it the outline of a large region strays up to 20 px from its border and cuts through hot pixels; with it, large regions keep more vertices and small ones are unchanged. Set to `0` for no cap. |
 | `--output_format` | `json` | Output format: `json` / `geojson` / `csv` |
 | `--visualize` | off | Save 5-panel figures per frame |
 | `--vis_dir` | `localization_vis/` | Output folder for visualizations |
@@ -305,13 +307,13 @@ python localize.py \
 | `--low_temp_c` | `60` | A region grows into connected (8-neighbour) pixels at least this hot |
 | `--min_seed_pixels` | `10` | Seed pixels a region needs, counted at the camera's resolution |
 
-Dilation, contours, the size filter and `fire_pixels_256` then run exactly as in Otsu mode. The results on all 738 FLAME 3 frames, with no classifier (`experiments/flame3/run_absolute_threshold.py`):
+Dilation, contours, the size filter and `fire_pixels_256` then run exactly as in Otsu mode. The results on all 738 FLAME 3 frames, with no classifier (`experiments/flame3/run_absolute_threshold.py`, `results/run_E_refined/all_frames/`):
 
 | | Otsu, plain | Otsu, second-level (default) | Absolute (80 / 60 °C) |
 |---|---|---|---|
 | Fire frames with at least one region (of 622) | 517 | 617 | 621 |
 | No Fire frames with at least one region (of 116) | 24 | 49 | 0 |
-| Area at ≥ 80 °C inside the outlines | 91.7% | 94.2% | 98.2% |
+| Area at ≥ 80 °C inside the outlines | 92.8% | 95.4% | 99.4% |
 
 **Second-level Otsu.** Otsu's threshold often lands low enough that the bright part fills most of the frame; the size filter then drops that one contour, and any fire in it (105 Fire and 92 No Fire frames). Second-level Otsu, on by default, rethresholds within the bright pixels instead (`--no_second_level_otsu` turns it off). It changes nothing on frames without that problem, and recovers 100 of the 105 fire frames. On No Fire frames it raises false regions from 24 to 49 (mostly one region covering 70–75% of the frame), but Otsu mode only localizes frames a detector has already called fire. The hottest pixel in any No Fire frame was 47.2 °C, 33 °C below the seed, but those scenes hold no engines or sun-heated metal. The one absolute-mode miss (frame `00531`, hottest 108 °C) has its hot pixels too scattered for any region to reach 10 seed pixels.
 
@@ -322,7 +324,9 @@ Dilation, contours, the size filter and `fire_pixels_256` then run exactly as in
 | v1 | MSER + NMS | `mser_min_area=60`, `iou=0.3` | Up to 44 boxes/frame |
 | v2 | MSER + NMS (tuned) | `mser_min_area=150`, `iou=0.2`, containment suppression | 2–15 boxes/frame |
 | v3 | Contour extraction | `epsilon=0.02`, pure Otsu, no merging | Fire boundary polygons |
-| v4 (current) | Contour + merging | `threshold_scale=0.85`, `merge_kernel=15`, `epsilon=0.01` | Merged polygons, denser arcs |
+| v4 (current) | Contour + merging | `threshold_scale=0.85`, `merge_kernel=15`, `epsilon=0.01` capped at 2 px | Merged polygons, denser arcs |
+
+**Outline accuracy.** Before the 2 px cap, 3.2% of the hot pixels on the 34 FLAME 3 test frames lay outside their own outline (22% in the worst contour); with it, 0.7%, all at the image border. Which regions are found does not change. Numbers and pictures: `results/run_E_refined/`.
 
 ---
 
@@ -366,7 +370,7 @@ python geolocate.py \
 - `dist_coeffs` (OpenCV order), optional `crop`, `altitude_reference`, and a `metadata_fields` mapping for the EXIF/XMP loader (`xmp:<prefix:Name>`, `exif:<TagName>` or `const:<value>`).
 - Intrinsics are rescaled to each image's resolution, but only for a plain resize: if the image's aspect ratio differs from the calibrated frame by more than rounding, it is rejected — add a `crop` entry instead.
 - `dji_mini4pro.json` is a **sample only**, ported from the reference pipeline: 82.1° **diagonal** FOV (only the diagonal reading is consistent with DJI's 24 mm-equivalent spec).
-- `dji_m30t_thermal.json` is the DJI M30T thermal camera used in the FLAME 3 dataset. Its intrinsics were measured by registering thermal frames to the wide camera (`experiments/flame3/measure_thermal_fov.py`): square pixels, fx = 697 px (matches DJI's 61° diagonal FOV), principal point off-centre at (334, 266). Pose comes from the paired raw RGB (`--exif_image_dir <class>/RGB/Raw`). See `docs/FLAME3_GEOLOCATION_HANDOFF.md`.
+- `dji_m30t_thermal.json` is the DJI M30T thermal camera used in the FLAME 3 dataset. Its intrinsics were measured by registering thermal frames to the wide camera (`experiments/flame3/measure_thermal_fov.py`): square pixels, fx = 697 px (matches DJI's 61° diagonal FOV), principal point off-centre at (334, 266). Pose comes from the paired raw RGB (`--exif_image_dir <class>/RGB/Raw`). The measurement and check scripts are in `experiments/flame3/`.
 
 > **Note on this repo's sample frames:** the thermal images behind `results/flame2_sample/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
 
@@ -381,25 +385,26 @@ python geolocate.py \
 
 Rays at or above the horizon never reach the ground; rays just below it land kilometres away with errors just as large. A ray is therefore reliable only if it is at least `--min_depression_deg` (default 10°) below the horizon and within `--max_range_m`. On flat ground that reliable area is a disk around the point below the drone (radius h / tan(min depression), or the max range if smaller). A region with unreliable vertices is **clipped to that disk** rather than dropped, and its centroid and area come from the clipped polygon. Only a region with no reliable part is `unreliable`. `docs/geolocation_worked_example.md` walks through one oblique projection by hand.
 
-**Swapping the metadata source.** Every loader implements one method, `load(frame_id, image_path) -> FrameMetadata` (`geoloc/metadata.py`). A telemetry-log loader only has to return the same `FrameMetadata`; `geolocate.py` and the math are unchanged.
+**Swapping the metadata source.** Every loader implements one method, `load(frame_id, image_path) -> FrameMetadata` (`geoloc/metadata.py`). A telemetry-log loader only has to return the same `FrameMetadata`; `geolocate.py` and the math are unchanged. `TimedTelemetryLoader` is the loader for video: telemetry samples at their own rate, interpolated to a frame's time (yaw along the shorter arc). It never interpolates across a hole in the log: a frame near one side of the hole gets that side's sample, and a frame deeper in gets no pose.
 
 **What each region gets:**
 - `geolocation_status` — `ok` (every vertex reliable, polygon unchanged), `clipped_to_reliable`, `unreliable` (no reliable part), or `missing_metadata`
 - `gps_polygon` — the reliable polygon, projected from `normalized × original_wh` (never `pixel_256`, because the 256 × 256 resize is anisotropic). Each vertex is `{lat, lon, ground_range_m, depression_deg}`; vertices created by clipping carry `"clip_vertex": true` (they lie on the reliability boundary, not on the fire edge). `null` for `unreliable` regions
 - `gps_centroid`, `ground_area_m2` — area-weighted centroid and area of that polygon, computed on the ground (for oblique views the image-space centroid is not the ground centroid). The polygon is a fire zone (merged hot spots and the gaps between them)
 - `fire_area_m2` — ground area of the hot pixels inside the region (`fire_pixels_256` from `localize.py`), each pixel run projected exactly on flat ground. Only reliable pixels count; `fire_area_excluded_fraction` is the share of hot pixels left out. `null` if `localize.py` did not provide hot pixels
+- `dilation_buffer_range_m` — `[smallest, largest]` distance on the ground by which the merge dilation pushed this region's outline outside its hot pixels, measured around the region's centroid. The smallest is sideways, the largest away from the drone. `[0, 0]` without merging, `null` for a region with no reliable part
 - `clipped`, `removed_area_fraction` — share of the original contour that was cut off, **measured in image pixels** (the removed part's ground area is unbounded or unreliable by definition); `unreliable_vertices` counts the original contour vertices by reason (`above_horizon` / `below_min_depression` / `beyond_max_range`)
 - `touches_frame_edge` — the fire continues outside the frame. Each `gps_polygon` vertex on the image border carries `"frame_edge_vertex": true`: the view ends there, not the fire
 - GeoJSON output contains `ok` and `clipped_to_reliable` regions, with `clipped` and `removed_area_fraction` in the properties
 - Clipping assumes flat ground. With both limits disabled, a region that crosses the horizon cannot be bounded and is `unreliable`
 - `fire_front_arc` stays `null` (out of scope)
 
-Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward by roughly this distance, so GPS outlines are larger than the burning area.
+Each frame also gets a `geolocation` block with the drone pose used, `gsd_center_m`, warnings (oblique view, altitude not AGL), and `dilation_buffer_m` — `localize.py`'s merge dilation pushes every polygon outward, so GPS outlines are larger than the burning area. This one value is that distance sideways at the image centre; in an oblique view the margin is longer away from the drone and grows with distance, so use each region's `dilation_buffer_range_m`.
 
 **Contour tables.** With `--tables_dir`, every contour gets its own CSV of geolocated border points, in the order of the border line. Columns: `frame_id, contour, point, lat, lon, ground_range_m, depression_deg, point_type`. `point_type` is `fire_edge`, `image_border` (the view ends here) or `clipped` (the reliability limit ends here). A contour with no coordinates still gets a table: blank coordinates, with `unreliable` or `missing_metadata` as `point_type`. Contour and point numbers match the pictures below.
 
 **Seeing the results on the image.** `visualize_geolocation.py` draws a `geolocate.py` JSON result back onto each thermal frame. Each picture shows:
-- each contour, numbered, as a border line through its numbered points, with its distance range from the drone, zone area and burning area
+- each contour, numbered, as a border line through its numbered points (every point is marked; on a contour with more than 40 only every Nth is numbered), with its distance range from the drone, zone area and burning area
 - ground-distance rings around the drone (`--rings_m`, default 100/200/400 m)
 - the reliability limit of the run, and the horizon
 - parts clipped as unreliable, hatched
@@ -413,37 +418,60 @@ python visualize_geolocation.py \
   --vis_dir geolocation_vis
 ```
 
-**Running the tests** (standard library `unittest`, synthetic inputs only):
+**Running the tests** (standard library `unittest`; synthetic inputs, plus one check on the saved `results/flame2_sample` output):
 ```bash
 python -m unittest discover -s tests -t .
 python -m tests.test_citrus_oracle    # prints the reference-code error table
 ```
 
-**Attribution.** The geolocation approach is adapted from [citrus-uav-pipeline](https://github.com/afif1230/citrus-uav-pipeline) by Afif El Bsat (MIT License — see `THIRD_PARTY_LICENSES/citrus-uav-pipeline.txt`). Differences from the reference: the image is never rotated (yaw rotates the ray, so focal length does not depend on a rotated canvas size), the FOV type is explicit, any gimbal pitch is supported, and missing metadata is never replaced by defaults. `tests/test_citrus_oracle.py` documents the two scale issues found in the reference (FOV interpreted as horizontal, focal length taken from the rotated canvas) with concrete numbers.
+**Attribution.** The geolocation approach is adapted from [citrus-uav-pipeline](https://github.com/afif1230/citrus-uav-pipeline) by Afif El Bsat (MIT License — see `THIRD_PARTY_LICENSES/citrus-uav-pipeline.txt`). Differences from the reference: the image is never rotated (yaw rotates the ray, so focal length does not depend on a rotated canvas size), the FOV type is explicit, any gimbal pitch is supported, missing metadata is never replaced by defaults, and metres are converted to lat/lon on the WGS84 ellipsoid (the reference's sphere is 0.2% off, 1 m at 500 m from the drone). `tests/test_citrus_oracle.py` documents the two scale issues found in the reference (FOV interpreted as horizontal, focal length taken from the rotated canvas) with concrete numbers.
 
 ---
 
 ### 7. Video (frame by frame)
 
-`process_video.py` runs localization and geolocation on a thermal video one frame at a time, the way a live stream arrives. Each frame goes through exactly the same steps as a still image. Output is one JSON of per-frame results, one contour table per contour, and optionally an annotated video with the geolocated borders drawn in.
+`process_video.py` runs localization and geolocation on a thermal video one frame at a time, the way a live stream arrives. Each frame goes through exactly the same steps as a still image, and the results are written as each frame finishes.
 
 ```bash
+# telemetry from the drone's subtitle track (DJI .SRT), matched to each frame by time
+python srt_to_telemetry.py --srt flight.SRT --output_csv telemetry.csv
 python process_video.py \
   --video flight.mp4 \
-  --telemetry_csv telemetry.csv \
+  --timed_telemetry_csv telemetry.csv \
   --camera_config camera_configs/<your_camera>.json \
   --csv_altitude_reference takeoff \
   --output_dir results/my_video --annotate
 ```
 
-- **Pose:** a video carries no per-frame metadata, so it comes from a telemetry CSV in the sidecar format above, one row per frame, with `frame_id` = the frame number zero-padded to `--frame_id_digits` (default 5). A frame without a row is reported as `missing_metadata` and the run continues.
+**Pose.** A video carries no per-frame metadata, so it comes from a CSV, in one of two forms:
+
+| Option | CSV | Use for |
+|---|---|---|
+| `--timed_telemetry_csv` | telemetry at its own rate: `time_s` (seconds from the start of the video), `latitude, longitude, altitude_agl_m, gimbal_yaw_deg, gimbal_pitch_deg, gimbal_roll_deg[, timestamp]`. Each frame gets the pose interpolated to its time; a frame farther than `--telemetry_max_gap_s` (default 1 s) from any sample gets none | real footage |
+| `--telemetry_csv` | one row per frame, `frame_id` = frame number zero-padded to `--frame_id_digits` (the sidecar format above) | test videos where no frame was ever dropped |
+
+Frame times come from the decoder, so dropped frames do not shift the matching. A frame without usable telemetry is reported as `missing_metadata` and the run continues. `srt_to_telemetry.py` makes the timed CSV from a DJI `.SRT` subtitle track (one entry per frame with position and gimbal angles): run it with `--show_keys` on a new file first, since the keys differ between drone models, then map each field with `--field` or fix it with `--const`. It was written against DJI's documented layout, not yet checked against a file from our drone.
+
+**Outputs** in `--output_dir`:
+
+| File | Contents |
+|---|---|
+| `frames.jsonl` | one JSON line per processed frame, written as each frame finishes: what a live consumer would read |
+| `border_points.csv` | one row per geolocated border point of every contour of every frame: `frame_id, video_time_s, timestamp, contour, point, lat, lon, ground_range_m, depression_deg, point_type` |
+| `fire_borders.geojson` | every geolocated border as a polygon with its frame and time, for a map |
+| `geolocated_results.json` | all frames in one file: `localize.py` + `geolocate.py` fields plus `frame_index`, `video_time_s`, `background_gray`, `timing_ms` |
+| `annotated.mp4` | with `--annotate`: the processed frames with borders and numbered points drawn in |
+| `<--tables_dir>/` | optional: one CSV per contour, as `geolocate.py --tables_dir` |
+
 - **Localization:** plain video has no temperatures, so this uses Otsu on every frame, with no detector in front. Its parameters and the reliability limits match `localize.py` and `geolocate.py`, except that second-level Otsu is off unless `--second_level_otsu`: without a detector it also turns more fire-free frames into false alarms.
+- **Background gate (optional):** `--max_background_gray N` skips a frame whose median grey level is above N. A camera that scales its picture to the scene shows the ground dark once fire is in view and mid-grey when there is none. It is off by default because it depends on the camera's gain behaviour: 60 suited FLAME 3's DJI M30T, the only camera it was tried on. Every frame's result carries `background_gray`, so the limit can be checked on new footage. A skipped frame has `fire_detected: false` and no regions.
+- **Slower hardware:** `--frame_step N` processes every Nth frame; skipped frames are not decoded and keep their times.
 
 **Tested on FLAME 3** (`experiments/flame3/make_video.py`, `compare_video.py`; `results/run_D_video/`): 70 fire stills from one pass and 55 No Fire stills, made into videos at one frame per still (3 s apart).
-- **Same as stills:** a lossless video gives identical contours to the stills in all 70 frames. A lossy MP4 (7x smaller) moves border points by at most 0.53 m for 90% of them.
+- **Same as stills:** a lossless video gives identical contours to the stills in all 70 frames. A lossy MP4 (7x smaller) moves border points by at most 0.52 m for 90% of them.
 - **Consistent between frames:** while the drone moves 20-48 m between frames, 87% of the fire lands within 5 m of where the next frame puts it (median).
 - **Fast:** about 10 ms per frame for localization plus geolocation at 640x512.
-- **Otsu's limits carry over:** fire was localized in 61 of 70 fire frames, and 21 of 55 No Fire frames produced regions. With `--second_level_otsu`: 70 of 70 fire frames, but 31 of 55 No Fire frames, so a detector is needed before Otsu on video.
+- **Otsu's limits carry over:** fire was localized in 61 of 70 fire frames, and 21 of 55 No Fire frames produced regions. With `--second_level_otsu`: 70 of 70 fire frames, but 31 of 55 No Fire frames. Adding `--max_background_gray 60`: still 70 of 70, and 8 of 55 (`results/run_E_refined/`; over all 738 stills, 617 of 622 fire frames and 8 of 116 No Fire frames). That limit was chosen on these frames, so a real detector before Otsu remains the safer answer on video.
 
 ---
 
@@ -483,7 +511,8 @@ python process_video.py \
     "parameters": {
       "threshold_scale": 0.85,
       "merge_kernel_size": 15,
-      "epsilon_factor": 0.01
+      "epsilon_factor": 0.01,
+      "max_epsilon_px": 2.0
     }
   },
   "results": [
@@ -497,7 +526,7 @@ python process_video.py \
       "fire_regions": [
         {
           "pixel_256": [{"x": 112, "y": 88}, {"x": 134, "y": 91}, "..."],
-          "normalized": [{"x": 0.4375, "y": 0.3437}, {"x": 0.5234, "y": 0.3554}, "..."],
+          "normalized": [{"x": 0.439453, "y": 0.345703}, {"x": 0.525391, "y": 0.357422}, "..."],
           "area_px": 1823.5,
           "n_points": 14,
           "original_wh": {"width": 640, "height": 512},
@@ -514,7 +543,7 @@ python process_video.py \
 
 **Coordinate systems:**
 - `pixel_256` — ordered contour points in 256×256 processing space
-- `normalized` — same points in [0,1] range, resolution-agnostic. This is what `geolocate.py` consumes to back-project to GPS coordinates.
+- `normalized` — the same points as positions across the image in [0,1], resolution-agnostic: the centre of pixel `i` is at `(i + 0.5) / 256`, so `normalized × original_wh` is that spot in the full-size image. This is what `geolocate.py` consumes to back-project to GPS coordinates.
 - `original_wh` — actual thermal image dimensions at inference time, for reference
 - `fire_pixels_256`, `fire_area_px` — the hot pixels (undilated mask) inside the region, as row runs `[row, first_col, last_col]` in 256×256 space, and their count. The outline is a merged fire zone; these are the pixels actually above threshold. `geolocate.py` turns them into `fire_area_m2`
 - `gps_polygon` — null here; filled by `geolocate.py` (see [Geolocation](#6-geolocation)). `fire_front_arc` stays null
@@ -542,7 +571,8 @@ python process_video.py \
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
 | `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
 | `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: numbered border points per contour, distance, areas, ground-distance rings, reliability limit, horizon |
-| `process_video.py` | Localization + geolocation on a thermal video, frame by frame, with pose from a per-frame telemetry CSV; per-frame JSON, contour tables, optional annotated video |
+| `process_video.py` | Localization + geolocation on a thermal video, frame by frame, with pose matched by time (or frame number) from a telemetry CSV; streams `frames.jsonl`, `border_points.csv`, `fire_borders.geojson`, optional annotated video |
+| `srt_to_telemetry.py` | Timed telemetry CSV from a drone video's `.SRT` subtitle track (DJI layout, configurable keys) |
 | `geoloc/` | Geolocation library: `camera.py` (config), `metadata.py` (loaders), `projection.py` (pure geometry) |
 
 ---
@@ -594,8 +624,8 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Flat-ground geolocation** — rays are intersected with a horizontal plane at the drone's altitude above ground. In hilly terrain the error grows with height error × tan(off-nadir angle) (e.g. 20 m of relief at 30° off-axis ≈ 11.5 m). A DEM can be added behind the `Terrain` interface in `geoloc/projection.py`.
 - **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning. An altitude error δh moves every point by about δh / h of its range. On FLAME 3 (Sycan Marsh) an SRTM elevation model shows the burn area is flat (a few metres of relief), so take-off altitude is a reasonable AGL there. Over hilly ground a DEM behind the `Terrain` interface is the general fix (not built yet).
 - **Laser-rangefinder height is unreliable over trees and smoke** — the laser measures the first surface it hits. On FLAME 3 only ~27% of laser readings hit the ground (within ±3 m of SRTM); most hit canopy or smoke 3–60 m higher, which makes `--altitude_source laser` heights too low. The comparison in `experiments/flame3/laser_check.py` therefore checks angle conventions, not ground accuracy.
-- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against DJI's own laser projection, which shares the gimbal angles, so absolute accuracy (e.g. a yaw bias) is untested. Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
-- **Outlines are fire zones** — `localize.py`'s region-merging dilation joins nearby hot spots into one outline, so `ground_area_m2` covers the hot spots, the gaps between them and a ~`dilation_buffer_m` margin. On FLAME 3 the hot pixels are a median ~15% of the outline. `fire_area_m2` is the ground area of the hot pixels themselves. Border coordinates sit outside the hot pixels by that same margin (about 7 px at 256×256, a median ~5.5 m per frame on the 34 test frames).
+- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against DJI's own laser projection, which shares the gimbal angles, so absolute accuracy is untested. One check without ground truth: consecutive video frames taken 43 m apart agree best with the yaw as recorded (0° to −3°), which rules out a bias the size of the magnetic declination (`experiments/flame3/pose_offset_check.py`, `results/run_E_refined/`). An error that moves every frame the same way would not show there. Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
+- **Outlines are fire zones** — `localize.py`'s region-merging dilation joins nearby hot spots into one outline, so `ground_area_m2` covers the hot spots, the gaps between them and a margin around them. On FLAME 3 the hot pixels are a median ~15% of the outline. `fire_area_m2` is the ground area of the hot pixels themselves. Border coordinates sit outside the hot pixels by that margin: 7 px at 256×256 in the image, but on the ground it depends on the direction and on how far away the region is. On the 34 test frames it is a median 6 m sideways and 16 m away from the drone, over 30 m for one region in ten, and up to 62 m for the farthest. Each region reports its own in `dilation_buffer_range_m`; the frame's single `dilation_buffer_m` (median 5.5 m) is only the sideways value at the image centre. For the same reason, hot spots far from the drone are merged across larger gaps than near ones.
 - **No lever-arm or time-sync correction** — the GPS antenna is assumed to be at the camera, and metadata is assumed to be captured at the same instant as the frame.
 
 ---

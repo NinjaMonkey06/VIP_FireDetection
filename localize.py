@@ -51,18 +51,18 @@ Parameter history:
     v2: MSER delta=3, min_area=150, max_area=6000, iou=0.2  → 2-15 boxes
     v3: contour extraction, epsilon=0.02, pure Otsu, no merging
     v4: dilation merging, threshold_scale=0.85, epsilon=0.01
+        + epsilon capped at 2 px (--max_epsilon_px), so large outlines keep their shape
+        + normalized points are pixel centres, (i + 0.5) / 256
 """
 
 import os
 import json
 import csv
 import argparse
+import sys
 import cv2
 import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.patches import Polygon as MplPolygon
 
 from detect_by_temperature import THERMAL_EXTS, index_temperature_files, load_temperatures
 
@@ -177,11 +177,17 @@ def dilate_mask_for_merging(mask, kernel_size):
     return cv2.dilate(mask, kernel, iterations=1)
 
 
-def extract_contours(mask, min_area, max_area, epsilon_factor):
+def extract_contours(mask, min_area, max_area, epsilon_factor, max_epsilon_px=None):
     """
     findContours on binary mask + approxPolyDP simplification.
     epsilon_factor=0.01 (v4 default) produces denser vertices than v3's 0.02,
     improving arc coverage for the fire propagation model.
+
+    epsilon is how far the simplified outline may leave the true one, and as a
+    fraction of the perimeter it grows with the region: up to 20 px on FLAME 3's
+    largest regions, more than the merge dilation's margin, so the outline cut
+    through hot pixels. max_epsilon_px caps it (None or 0 = no cap): small regions
+    are unchanged, large ones keep more vertices.
     """
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filtered = []
@@ -191,6 +197,8 @@ def extract_contours(mask, min_area, max_area, epsilon_factor):
             continue
         perimeter  = cv2.arcLength(cnt, closed=True)
         epsilon    = epsilon_factor * perimeter
+        if max_epsilon_px:
+            epsilon = min(epsilon, max_epsilon_px)
         simplified = cv2.approxPolyDP(cnt, epsilon, closed=True)
         if len(simplified) >= 3:
             filtered.append(simplified)
@@ -219,14 +227,18 @@ def fire_pixel_runs(mask, dilated_mask, contours):
 
 
 def encode_contours(contours, original_size, fire_runs=None):
+    """pixel_256 holds the contour's pixel indices. normalized is where those pixels'
+    centres lie across the image (pixel i covers [i, i + 1) of 256, so its centre is
+    at (i + 0.5) / 256): normalized × original_wh is then the same spot in the
+    full-size image, on the same grid as the fire_pixels_256 cells."""
     orig_w, orig_h = original_size
     encoded = []
     for i, cnt in enumerate(contours):
         pts = cnt.reshape(-1, 2)
         region = {
             "pixel_256":      [{"x": int(p[0]), "y": int(p[1])} for p in pts],
-            "normalized":     [{"x": round(float(p[0]) / PROCESS_SIZE, 6),
-                                "y": round(float(p[1]) / PROCESS_SIZE, 6)} for p in pts],
+            "normalized":     [{"x": round((float(p[0]) + 0.5) / PROCESS_SIZE, 6),
+                                "y": round((float(p[1]) + 0.5) / PROCESS_SIZE, 6)} for p in pts],
             "area_px":        round(float(cv2.contourArea(cnt)), 2),
             "n_points":       len(pts),
             "original_wh":    {"width": orig_w, "height": orig_h},
@@ -240,11 +252,12 @@ def encode_contours(contours, original_size, fire_runs=None):
     return encoded
 
 
-def regions_from_mask(mask, original_size, merge_kernel_size, min_area, max_area, epsilon_factor):
+def regions_from_mask(mask, original_size, merge_kernel_size, min_area, max_area, epsilon_factor,
+                      max_epsilon_px=None):
     """Fire mask → merged, filtered, simplified contours and their encoded regions.
     Returns (dilated mask, contours, encoded regions)."""
     dilated_mask = dilate_mask_for_merging(mask, merge_kernel_size)
-    contours = extract_contours(dilated_mask, min_area, max_area, epsilon_factor)
+    contours = extract_contours(dilated_mask, min_area, max_area, epsilon_factor, max_epsilon_px)
     return dilated_mask, contours, encode_contours(contours, original_size,
                                                    fire_pixel_runs(mask, dilated_mask, contours))
 
@@ -292,6 +305,10 @@ def visualize_localization(thermal_path, rgb_path, gray, mask, dilated_mask,
                            contours, frame_id, pred_label,
                            otsu_thresh, applied_thresh, out_dir):
     """5-panel (4 without RGB): RGB | Thermal | Otsu mask | Dilated mask | Contour overlay."""
+    import matplotlib.pyplot as plt          # only needed for pictures, so not at import time
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import Polygon as MplPolygon
+
     os.makedirs(out_dir, exist_ok=True)
     th_color_rgb = cv2.cvtColor(cv2.applyColorMap(gray, cv2.COLORMAP_INFERNO), cv2.COLOR_BGR2RGB)
 
@@ -337,6 +354,8 @@ def visualize_localization(thermal_path, rgb_path, gray, mask, dilated_mask,
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles default to cp1252, which cannot print ✓
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Phase 2: Fire Localization v4")
 
     parser.add_argument("--inference_json",  default=None,
@@ -385,6 +404,9 @@ def main():
     parser.add_argument("--epsilon_factor",    type=float, default=0.01,
                         help="approxPolyDP epsilon as fraction of perimeter (default: 0.01). "
                              "Lower = denser vertices.")
+    parser.add_argument("--max_epsilon_px",    type=float, default=2.0,
+                        help="Cap on that epsilon in pixels at 256x256, so the outline of a large region "
+                             "stays within this distance of its true border (default: 2). Set 0 for no cap.")
 
     args = parser.parse_args()
 
@@ -458,7 +480,7 @@ def main():
                 threshold_fields["second_level_otsu_rounds"] = rounds
         dilated_mask, contours, encoded_regions = regions_from_mask(
             mask, original_size, args.merge_kernel_size, args.min_contour_area, args.max_contour_area,
-            args.epsilon_factor)
+            args.epsilon_factor, args.max_epsilon_px)
 
         result.update({
             "localization_run":  True,
@@ -505,6 +527,7 @@ def main():
             "min_contour_area":  args.min_contour_area,
             "max_contour_area":  args.max_contour_area,
             "epsilon_factor":    args.epsilon_factor,
+            "max_epsilon_px":    args.max_epsilon_px,
             "output_format":     args.output_format,
         }
     })

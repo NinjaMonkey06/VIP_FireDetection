@@ -18,6 +18,9 @@ Differences from the reference:
     - Ground intersection is behind a Terrain interface (flat ground for now).
     - Vertices at, above or near the horizon are marked unreliable instead of
       being projected to huge, attitude-sensitive distances (ReliabilityLimits).
+    - Metres ↔ lat/lon use the WGS84 ellipsoid's radii of curvature at the drone's
+      latitude. The reference's sphere of equatorial radius is 0.2% long
+      north-south and 0.15% short east-west at 43° latitude (1 m in 500 m).
 
 Frames:
     camera  x right, y down, z along the optical axis (OpenCV convention)
@@ -34,7 +37,8 @@ from typing import List, Optional, Protocol, Tuple
 import cv2
 import numpy as np
 
-EARTH_RADIUS_M = 6378137.0   # WGS84 equatorial radius, spherical approximation (as in reference)
+WGS84_A_M = 6378137.0            # WGS84 semi-major axis
+WGS84_E2 = 6.69437999014e-3      # WGS84 first eccentricity squared
 
 # camera (right, down, optical) → gimbal (forward, right, down)
 CAM_TO_GIMBAL = np.array([[0.0, 0.0, 1.0],
@@ -177,12 +181,23 @@ def ground_sample_distance_m(intr: Intrinsics, pose: CameraPose,
 
 
 # ==================== Local meters ↔ lat/lon ====================
+def earth_radii_m(lat_deg: float) -> Tuple[float, float]:
+    """Radii of curvature of the WGS84 ellipsoid at a latitude: (meridional, prime
+    vertical). One radian of latitude is `meridional` metres on the ground, and one
+    radian of longitude is `prime vertical · cos(lat)` metres."""
+    w = 1.0 - WGS84_E2 * math.sin(math.radians(lat_deg)) ** 2
+    return WGS84_A_M * (1.0 - WGS84_E2) / w ** 1.5, WGS84_A_M / math.sqrt(w)
+
+
 def offset_to_latlon(lat0: float, lon0: float, north_m, east_m):
-    """Local north/east meters around (lat0, lon0) → lat/lon (equirectangular)."""
+    """Local north/east meters around (lat0, lon0) → lat/lon. A tangent-plane
+    approximation with the ellipsoid's radii at lat0: exact to a few millimetres
+    within the kilometre or so a frame covers."""
     north_m = np.asarray(north_m, dtype=np.float64)
     east_m = np.asarray(east_m, dtype=np.float64)
-    lat = lat0 + np.degrees(north_m / EARTH_RADIUS_M)
-    lon = lon0 + np.degrees(east_m / (EARTH_RADIUS_M * math.cos(math.radians(lat0))))
+    meridional, prime_vertical = earth_radii_m(lat0)
+    lat = lat0 + np.degrees(north_m / meridional)
+    lon = lon0 + np.degrees(east_m / (prime_vertical * math.cos(math.radians(lat0))))
     return lat, lon
 
 
@@ -190,9 +205,16 @@ def latlon_to_offset(lat0: float, lon0: float, lat, lon):
     """Exact inverse of offset_to_latlon (uses the base latitude for the east scale)."""
     lat = np.asarray(lat, dtype=np.float64)
     lon = np.asarray(lon, dtype=np.float64)
-    north = np.radians(lat - lat0) * EARTH_RADIUS_M
-    east = np.radians(lon - lon0) * EARTH_RADIUS_M * math.cos(math.radians(lat0))
+    meridional, prime_vertical = earth_radii_m(lat0)
+    north = np.radians(lat - lat0) * meridional
+    east = np.radians(lon - lon0) * prime_vertical * math.cos(math.radians(lat0))
     return north, east
+
+
+def latlon_to_px(lat0: float, lon0: float, latlon: np.ndarray, intr: Intrinsics, pose: CameraPose) -> np.ndarray:
+    """(N, 2) [lat, lon] on flat ground → (N, 2) pixels, for a camera above (lat0, lon0)."""
+    north, east = latlon_to_offset(lat0, lon0, latlon[:, 0], latlon[:, 1])
+    return ground_to_pixels(np.column_stack((north, east)), intr, pose)
 
 
 # ==================== Polygons ====================
@@ -272,13 +294,17 @@ def clip_polygon_disk(pts: np.ndarray, radius: float, sides: int = DISK_SIDES) -
     centroid stay correct."""
     angles = np.linspace(0.0, 2.0 * math.pi, sides, endpoint=False)
     disk = radius * np.column_stack((np.cos(angles), np.sin(angles)))     # counter-clockwise
+    nxt = np.roll(disk, -1, axis=0)
+    a, b = -(nxt[:, 1] - disk[:, 1]), nxt[:, 0] - disk[:, 0]              # inside = left of p→q
+    c = -(a * disk[:, 0] + b * disk[:, 1])
     out = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
     for i in range(sides):
         if len(out) == 0:
             break
-        p, q = disk[i], disk[(i + 1) % sides]
-        a, b = -(q[1] - p[1]), q[0] - p[0]                                 # inside = left of p→q
-        out = clip_polygon_halfplane(out, a, b, -(a * p[0] + b * p[1]))
+        # A half-plane that already holds every vertex leaves the polygon unchanged.
+        if (a[i] * out[:, 0] + b[i] * out[:, 1] + c[i] >= 0).all():
+            continue
+        out = clip_polygon_halfplane(out, a[i], b[i], c[i])
     return out
 
 
