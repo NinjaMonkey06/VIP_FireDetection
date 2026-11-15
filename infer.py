@@ -19,6 +19,7 @@ Output:
 import os
 import json
 import argparse
+import sys
 import torch
 import numpy as np
 from PIL import Image
@@ -144,6 +145,8 @@ def visualize_prediction(rgb_path, th_path, pred_label, probs, out_dir, filename
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles default to cp1252, which cannot print ✓
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="MidFusionNet Inference Script")
     parser.add_argument("--rgb_dir",     required=True, help="Path to RGB images folder")
     parser.add_argument("--thermal_dir", required=True, help="Path to thermal images folder")

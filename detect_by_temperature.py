@@ -30,6 +30,7 @@ Usage:
 import argparse
 import json
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -94,6 +95,8 @@ def build_results(filenames, temperature_files, fire_temp_c, min_hot_pixels, cla
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles default to cp1252, which cannot print ✓
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Fire / no-fire decision from radiometric temperatures")
     parser.add_argument("--thermal_dir",     required=True,
                         help="Thermal images localize.py will use (frames are taken from here)")

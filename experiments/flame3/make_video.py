@@ -9,9 +9,11 @@ apart) that contains --first_frame, sorts it by capture time and writes:
     thermal_lossless.avi   the same frames, FFV1 (lossless), to separate the effect
                            of compression from the effect of video processing
     telemetry.csv          one row per video frame: geolocate.py's sidecar format
-                           (frame_id = frame number), plus timestamp and the source
-                           still. A video carries no per-frame EXIF, so this stands
-                           in for the drone's telemetry stream.
+                           (frame_id = frame number) plus time_s (the frame's time in
+                           the video), timestamp and the source still, so it works
+                           with both --telemetry_csv and --timed_telemetry_csv of
+                           process_video.py. A video carries no per-frame EXIF, so
+                           this stands in for the drone's telemetry stream.
 
 The stills are 2-4 s apart (timestamps to the second), so the video is closer to a
 time-lapse than to 30 fps footage. Pose comes from the paired raw RGB's XMP, read
@@ -51,6 +53,8 @@ def capture_pass(metas, first_frame, max_gap_s):
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):      # Windows consoles default to cp1252, which cannot print ✓
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Build a thermal test video + telemetry from a FLAME 3 pass")
     parser.add_argument("--dataset_root", required=True)
     parser.add_argument("--cls", required=True, choices=["Fire", "No Fire"])
@@ -87,14 +91,15 @@ def main():
         for w in writers:
             w.write(img)
         m = metas[f]
-        rows.append({"frame_id": f"{i:05d}", "latitude": m.latitude_deg, "longitude": m.longitude_deg,
+        rows.append({"frame_id": f"{i:05d}", "time_s": round(i / args.fps, 3),
+                     "latitude": m.latitude_deg, "longitude": m.longitude_deg,
                      "altitude_agl_m": m.altitude_agl_m, "gimbal_yaw_deg": m.gimbal_yaw_deg,
                      "gimbal_pitch_deg": m.gimbal_pitch_deg, "gimbal_roll_deg": m.gimbal_roll_deg,
                      "timestamp": m.timestamp.isoformat(), "source_frame": f})
     for w in writers:
         w.release()
     with open(os.path.join(args.output_dir, "telemetry.csv"), "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=[*CSV_COLUMNS, "timestamp", "source_frame"])
+        writer = csv.DictWriter(fh, fieldnames=[*CSV_COLUMNS, "time_s", "timestamp", "source_frame"])
         writer.writeheader()
         writer.writerows(rows)
 

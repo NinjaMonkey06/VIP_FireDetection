@@ -232,6 +232,13 @@ class TestSidecarCsvLoader(TempDirTest):
             with self.subTest(fid=fid), self.assertRaises(MetadataError):
                 loader.load(fid)
 
+    def test_unreadable_values_are_metadata_errors(self):
+        loader = SidecarCsvLoader(self.write("text_alt,34.15,-117.85,n/a,90,-90,0,\n"
+                                             "bad_time,34.15,-117.85,80,90,-90,0,yesterday\n"))
+        for fid in ("text_alt", "bad_time"):     # geolocate.py reports these frames instead of stopping
+            with self.subTest(fid=fid), self.assertRaises(MetadataError):
+                loader.load(fid)
+
 
 if __name__ == "__main__":
     unittest.main()

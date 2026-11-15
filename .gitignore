@@ -16,5 +16,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Datasets (downloaded separately; see docs/FLAME3_GEOLOCATION_HANDOFF.md)
+# Datasets (downloaded separately; FLAME 3 CV subset from IEEE DataPort, see README)
 data/
