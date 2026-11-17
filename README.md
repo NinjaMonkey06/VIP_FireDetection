@@ -21,6 +21,7 @@ A hybrid deep learning + classical computer vision pipeline for real-time wildfi
   - [5. Localization](#5-localization)
   - [6. Geolocation](#6-geolocation)
   - [7. Video (frame by frame)](#7-video-frame-by-frame)
+  - [8. Recording from a camera](#8-recording-from-a-camera)
 - [Output Format](#output-format)
 - [Script Reference](#script-reference)
 - [Model Architecture](#model-architecture)
@@ -103,6 +104,7 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── geolocate.py        # Phase 3: contour pixel → GPS (CLI)
 ├── visualize_geolocation.py  # draws geolocate.py results on the thermal frames
 ├── process_video.py    # localization + geolocation on a thermal video, frame by frame
+├── record_camera.py    # records video from a camera, with the capture time of every frame
 ├── srt_to_telemetry.py # per-frame telemetry CSV from a drone video's .SRT subtitle track
 ├── geoloc/             # Camera-agnostic geolocation library (no rendering code)
 │   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
@@ -450,7 +452,7 @@ python process_video.py \
 | `--timed_telemetry_csv` | telemetry at its own rate: `time_s` (seconds from the start of the video), `latitude, longitude, altitude_agl_m, gimbal_yaw_deg, gimbal_pitch_deg, gimbal_roll_deg[, timestamp]`. Each frame gets the pose interpolated to its time; a frame farther than `--telemetry_max_gap_s` (default 1 s) from any sample gets none | real footage |
 | `--telemetry_csv` | one row per frame, `frame_id` = frame number zero-padded to `--frame_id_digits` (the sidecar format above) | test videos where no frame was ever dropped |
 
-Frame times come from the decoder, so dropped frames do not shift the matching. A frame without usable telemetry is reported as `missing_metadata` and the run continues. `srt_to_telemetry.py` makes the timed CSV from a DJI `.SRT` subtitle track (one entry per frame with position and gimbal angles): run it with `--show_keys` on a new file first, since the keys differ between drone models, then map each field with `--field` or fix it with `--const`. It was written against DJI's documented layout, not yet checked against a file from our drone.
+Frame times come from the decoder, so dropped frames do not shift the matching. For a video recorded from a live camera, pass `--frame_times_csv` (see [Recording from a camera](#8-recording-from-a-camera)). A frame without usable telemetry is reported as `missing_metadata` and the run continues. `srt_to_telemetry.py` makes the timed CSV from a DJI `.SRT` subtitle track (one entry per frame with position and gimbal angles): run it with `--show_keys` on a new file first, since the keys differ between drone models, then map each field with `--field` or fix it with `--const`. It was written against DJI's documented layout, not yet checked against a file from our drone.
 
 **Outputs** in `--output_dir`:
 
@@ -472,6 +474,36 @@ Frame times come from the decoder, so dropped frames do not shift the matching. 
 - **Consistent between frames:** while the drone moves 20-48 m between frames, 87% of the fire lands within 5 m of where the next frame puts it (median).
 - **Fast:** about 10 ms per frame for localization plus geolocation at 640x512.
 - **Otsu's limits carry over:** fire was localized in 61 of 70 fire frames, and 21 of 55 No Fire frames produced regions. With `--second_level_otsu`: 70 of 70 fire frames, but 31 of 55 No Fire frames. Adding `--max_background_gray 60`: still 70 of 70, and 8 of 55 (`results/run_E_refined/`; over all 738 stills, 617 of 622 fire frames and 8 of 116 No Fire frames). That limit was chosen on these frames, so a real detector before Otsu remains the safer answer on video.
+
+---
+
+### 8. Recording from a camera
+
+`record_camera.py` records video from a camera the way a webcam is read (OpenCV's `VideoCapture`), and writes the real capture time of every frame next to it.
+
+```bash
+python record_camera.py --source 0 --output_dir results/flight_01/recording --preview
+python process_video.py   --video results/flight_01/recording/video.mp4   --frame_times_csv results/flight_01/recording/frame_times.csv   --timed_telemetry_csv telemetry.csv   --camera_config camera_configs/<your_camera>.json   --output_dir results/flight_01/processed --annotate
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--source` | `0` | Camera number (`0` = the first camera: a webcam, a USB thermal camera, a USB capture card), `picamera` (a Raspberry Pi camera module), a stream URL (`rtsp://...`), or a video file |
+| `--output_dir` | required | Where the recording goes |
+| `--codec` | `mp4v` | `mp4v`: small, lossy. `mjpg`: larger, light on the processor. `ffv1`: lossless |
+| `--width`, `--height`, `--fps` | camera's own | Requests to the camera; it may give something else, and `recording.json` says what it gave |
+| `--duration_s` | off | Stop after this many seconds |
+| `--preview` | off | Show the picture while recording; `q` stops |
+
+Stop with Ctrl+C, `q` in the preview, or `--duration_s`. It writes `video.mp4` (or `.avi`), `frame_times.csv` (`frame_index, time_s, utc_time`) and `recording.json` (frame size, nominal and measured frame rate, start and end time).
+
+**On a Raspberry Pi.** The recorder is meant to run on the computer that flies with the camera.
+- A USB camera is a camera number, as on any computer. The Pi's own camera module (ribbon cable) needs `--source picamera` and the `picamera2` library (`sudo apt install python3-picamera2 python3-opencv`).
+- Use `--codec mjpg`, the lightest on the Pi's processor, and `--duration_s` or Ctrl+C over SSH instead of `--preview`.
+- A Pi has no battery-backed clock: without a network it starts with the wrong date, so `utc_time` is wrong unless the clock is set before the flight. `time_s` is not affected.
+- The `picamera` source is tested against a stand-in for the library, not yet on a real Pi.
+
+**Why the frame times.** A camera does not deliver frames at exactly the rate the video file claims, so the file's clock drifts from real time: 0.08 s in a 5 s webcam test, which would be about 10 s over a 10-minute flight. With `--frame_times_csv`, `process_video.py` uses each frame's real capture time (`time_s`, seconds since the first frame) to pick the drone's pose. The telemetry's `time_s` must count from the same instant: the recording's first frame, whose UTC time is `start_utc` in `recording.json`. `utc_time` comes from the recording computer's clock, so set that clock before a flight if the telemetry is stamped by GPS time.
 
 ---
 
@@ -571,6 +603,7 @@ Frame times come from the decoder, so dropped frames do not shift the matching. 
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
 | `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
 | `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: numbered border points per contour, distance, areas, ground-distance rings, reliability limit, horizon |
+| `record_camera.py` | Records video from a camera (number, stream URL or file) with the real capture time of every frame, for `process_video.py --frame_times_csv` |
 | `process_video.py` | Localization + geolocation on a thermal video, frame by frame, with pose matched by time (or frame number) from a telemetry CSV; streams `frames.jsonl`, `border_points.csv`, `fire_borders.geojson`, optional annotated video |
 | `srt_to_telemetry.py` | Timed telemetry CSV from a drone video's `.SRT` subtitle track (DJI layout, configurable keys) |
 | `geoloc/` | Geolocation library: `camera.py` (config), `metadata.py` (loaders), `projection.py` (pure geometry) |

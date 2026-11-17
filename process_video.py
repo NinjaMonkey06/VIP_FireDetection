@@ -15,6 +15,9 @@ Pose. A video carries no per-frame metadata, so it comes from one of:
                             right when no frame was ever dropped, e.g. test videos
                             from experiments/flame3/make_video.py.
 Frame times come from the decoder, so dropped frames do not shift the matching. A
+video recorded from a live camera (record_camera.py) does not keep real time: the
+camera delivers frames unevenly while the file claims a fixed rate. Pass its
+frame_times.csv with --frame_times_csv and each frame gets its real capture time. A
 frame without usable telemetry is reported as missing_metadata and the run goes on.
 
 Localization. A plain video has no temperatures, so Otsu runs on every frame with
@@ -63,6 +66,7 @@ import localize
 from geoloc.camera import load_camera_config
 from geoloc.metadata import MetadataError, SidecarCsvLoader, TimedTelemetryLoader
 from geoloc.projection import CameraPose, ReliabilityLimits, latlon_to_px
+from record_camera import load_frame_times
 
 MAX_POINT_LABELS = 40   # a contour with more border points has only every Nth one numbered
 
@@ -184,6 +188,9 @@ def main():
     parser.add_argument("--csv_altitude_reference", default="agl", choices=["agl", "takeoff", "msl"])
     parser.add_argument("--telemetry_max_gap_s", type=float, default=1.0,
                         help="Timed telemetry: a frame farther than this from its nearest sample gets no pose")
+    parser.add_argument("--frame_times_csv",  default=None,
+                        help="record_camera.py's frame_times.csv: each frame's real capture time, used instead "
+                             "of the video file's own clock. Give it for anything recorded from a live camera")
     parser.add_argument("--frame_id_digits",  type=int, default=5,
                         help="--telemetry_csv: frame_id = frame number zero-padded to this many digits")
     parser.add_argument("--frame_step",       type=int, default=1,
@@ -228,10 +235,17 @@ def main():
     if not cap.isOpened():
         parser.error(f"cannot open {args.video}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    frame_times = None
+    if args.frame_times_csv:
+        try:
+            frame_times = load_frame_times(args.frame_times_csv)
+        except (OSError, ValueError) as e:
+            parser.error(str(e))
     os.makedirs(args.output_dir, exist_ok=True)
     telemetry = args.timed_telemetry_csv or args.telemetry_csv
     print(f"[✓] {args.video}: {fps:g} fps  |  telemetry: {telemetry} "
-          f"({'by time' if timed else 'by frame number'})  |  camera: {camera.name}\n")
+          f"({'by time' if timed else 'by frame number'})  |  frame times: "
+          f"{args.frame_times_csv or 'from the video file'}  |  camera: {camera.name}\n")
 
     results = []
     counts = {"frames_geolocated": 0, "frames_missing_metadata": 0, "regions_geolocated": 0,
@@ -251,7 +265,7 @@ def main():
             ok, frame = cap.read()
             if not ok:
                 break
-            t_video = frame_time_s(cap, index, fps)
+            t_video = frame_times.get(index) if frame_times is not None else frame_time_s(cap, index, fps)
             t0 = time.perf_counter()
             result = {"frame_id": f"{index:0{args.frame_id_digits}d}", "frame_index": index,
                       "video_time_s": None if t_video is None else round(t_video, 3),
@@ -260,7 +274,9 @@ def main():
             t1 = time.perf_counter()
             if timed is not None:
                 if t_video is None:
-                    loader = ResolvedMetadata(error=MetadataError("the video reports no frame times and no fps"))
+                    loader = ResolvedMetadata(error=MetadataError(
+                        f"no time for this frame in {args.frame_times_csv}" if frame_times is not None else
+                        "the video reports no frame times and no fps"))
                 else:
                     try:
                         loader = ResolvedMetadata(meta=timed.at(t_video))
@@ -302,14 +318,15 @@ def main():
     timing = {k: round(float(np.median([r["timing_ms"][k] for r in results])), 1)
               for k in ("localize", "geolocate", "annotate")} if results else {}
     summary = {"video": args.video, "telemetry": telemetry, "telemetry_matching": "time" if timed else "frame_number",
-               "camera": camera.name, "fps": fps, "frames_read": index, "frames_processed": processed,
+               "camera": camera.name, "fps": fps,
+               "frame_times": "frame_times_csv" if frame_times is not None else "video file", "frames_read": index, "frames_processed": processed,
                "frame_step": args.frame_step,
                "frames_with_regions": sum(bool(r["fire_regions"]) for r in results),
                "frames_skipped_bright_background": sum(not r["localization_run"] for r in results),
                "regions": sum(len(r["fire_regions"]) for r in results), "geolocation": counts,
                "median_timing_ms": timing,
                "parameters": {k: v for k, v in vars(args).items()
-                              if k not in ("video", "telemetry_csv", "timed_telemetry_csv", "camera_config",
+                              if k not in ("video", "telemetry_csv", "timed_telemetry_csv", "frame_times_csv", "camera_config",
                                            "output_dir", "tables_dir")}}
     with open(os.path.join(args.output_dir, "geolocated_results.json"), "w") as f:
         json.dump({"summary": summary, "results": results}, f, indent=2, allow_nan=False)
