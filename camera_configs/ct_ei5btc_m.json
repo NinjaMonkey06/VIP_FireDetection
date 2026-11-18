@@ -1,0 +1,21 @@
+{
+  "_notes": [
+    "CT-EI5BTC-M infrared thermal imaging module: 640x512 uncooled VOx detector, 12 um pixel pitch, 9.1 mm lens,",
+    "USB UVC output (YUYV, up to 50 fps). The camera for the campus flight test.",
+    "Intrinsics from the DATASHEET, not calibrated: horizontal FOV 45.7 deg gives fx = 759.4 px. The lens and pixel",
+    "pitch give the same (9.1 mm / 12 um = 758.3 px), and so does the stated vertical FOV (37.3 deg).",
+    "Treat it as nominal: the DJI M30T thermal camera has the same lens and pitch on paper, and measured 697 px,",
+    "8% less. A focal length error moves every point by that fraction of its distance from the image centre.",
+    "cx, cy default to the image centre; no distortion model. Calibrate before trusting sub-metre numbers.",
+    "Not radiometric: it gives a picture, not temperatures, so localization uses Otsu (no absolute mode).",
+    "Use the white-hot palette: grey level then rises with temperature, which Otsu needs.",
+    "Pose does not come from this camera: process_video.py takes it from a telemetry CSV, so there are no",
+    "metadata_fields. How the camera is mounted on the drone decides where its yaw and pitch come from."
+  ],
+  "name": "CT-EI5BTC-M thermal (9.1 mm)",
+  "calibration_width": 640,
+  "calibration_height": 512,
+  "fov_deg": 45.7,
+  "fov_type": "horizontal",
+  "dist_coeffs": []
+}

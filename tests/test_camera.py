@@ -99,6 +99,19 @@ class TestShippedConfigs(unittest.TestCase):
         self.assertAlmostEqual(k.fx / focal_from_fov(61.0, "diagonal", 640, 512), 1.0, delta=0.01)
         LaserHeightLoader(c)    # maps the laser fields
 
+    def test_ct_ei5btc_m_datasheet_values_agree(self):
+        # Datasheet: 640x512, 12 um pitch, 9.1 mm lens, FOV 45.7 x 37.3 deg. All three give one focal length.
+        c = load_camera_config(os.path.join(CONFIG_DIR, "ct_ei5btc_m.json"))
+        k = c.intrinsics_for(640, 512)
+        self.assertEqual((k.fx, k.cx, k.cy), (k.fy, 320.0, 256.0))
+        self.assertAlmostEqual(k.fx / (9.1e-3 / 12e-6), 1.0, delta=0.005)
+        self.assertAlmostEqual(2 * math.degrees(math.atan(256.0 / k.fy)), 37.3, delta=0.1)
+        # at 50 m straight down the picture covers about 42 m x 34 m, 6.6 cm per pixel
+        ne = pixels_to_ground(np.array([[0.0, 256.0], [640.0, 256.0], [320.0, 0.0], [320.0, 512.0]]), k,
+                              CameraPose(50.0, 0.0))
+        self.assertAlmostEqual(ne[1, 1] - ne[0, 1], 42.1, delta=0.1)
+        self.assertAlmostEqual(ne[2, 0] - ne[3, 0], 33.7, delta=0.1)
+
     def test_m30t_boresight_on_flame3_frame_00001(self):
         # FLAME 3 Fire/00001: 55.182 m above take-off, gimbal yaw 27.6°, pitch -7.1°. The
         # principal point is the gimbal axis, so it lands h / tan(7.1°) = 443 m out along yaw.

@@ -93,6 +93,32 @@ def camera_to_ned(pose: CameraPose) -> np.ndarray:
     return gimbal_to_ned(pose.yaw_deg, pose.pitch_deg, pose.roll_deg) @ CAM_TO_GIMBAL
 
 
+def camera_angles_from_vehicle(vehicle_yaw_deg: float, vehicle_pitch_deg: float, vehicle_roll_deg: float,
+                               mount_yaw_deg: float = 0.0, mount_pitch_deg: float = -90.0,
+                               mount_roll_deg: float = 0.0) -> Tuple[float, float, float]:
+    """Absolute (yaw, pitch, roll) of a camera fixed to a vehicle, from the vehicle's
+    attitude and how the camera is mounted on it. Without a gimbal the camera tilts
+    with the vehicle, so its absolute angles are the two rotations combined.
+
+    The mount angles are the camera's angles on a level vehicle that points north:
+    yaw clockwise from the nose (seen from above), pitch -90 = straight down, roll.
+    For a camera looking straight down, mount yaw is where the top of the picture
+    points: 0 = towards the nose.
+
+    Looking straight down, yaw and roll cannot be told apart; roll is then set to 0
+    and yaw carries the rotation. Any triple returned gives the same camera rotation."""
+    R = (gimbal_to_ned(vehicle_yaw_deg, vehicle_pitch_deg, vehicle_roll_deg)
+         @ gimbal_to_ned(mount_yaw_deg, mount_pitch_deg, mount_roll_deg))
+    pitch = -math.degrees(math.asin(max(-1.0, min(1.0, R[2, 0]))))
+    if abs(R[2, 0]) < 1.0 - 1e-9:
+        yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+        roll = math.degrees(math.atan2(R[2, 1], R[2, 2]))
+    else:                                   # optical axis vertical
+        yaw = math.degrees(math.atan2(-R[0, 1], R[1, 1]))
+        roll = 0.0
+    return yaw, pitch, roll
+
+
 # ==================== Pixels ↔ normalized camera coordinates ====================
 def pixels_to_normalized(points_px: np.ndarray, intr: Intrinsics) -> np.ndarray:
     """(N, 2) pixels → (N, 2) undistorted normalized coords ((u-cx)/fx, (v-cy)/fy)."""

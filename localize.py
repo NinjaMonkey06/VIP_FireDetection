@@ -147,6 +147,27 @@ def second_level_otsu_mask(gray, blur_kernel, threshold_scale, merge_kernel_size
     return mask, otsu_thresh, applied_thresh, rounds
 
 
+def hotspot_fire_mask(gray, blur_kernel, sigmas=6.0, min_contrast=25):
+    """
+    Pixels that stand well above the picture's typical level: brighter than the median
+    by at least `sigmas` times the picture's spread (a robust standard deviation), and
+    by at least `min_contrast` grey levels.
+
+    Otsu splits the picture into two groups, so it only isolates fire when the fire is a
+    sizeable share of the picture. A small hot area in a large scene (an early fire, a
+    test target) is too few pixels to count as a group: Otsu then cuts the background in
+    two, and the size filter drops the result. This rule measures the background alone
+    and asks what stands out from it, however small.
+    Returns: mask, applied threshold.
+    """
+    gray_blurred = blur_for_threshold(gray, blur_kernel)
+    level = gray_blurred.astype(np.float64)
+    median = np.median(level)
+    spread = 1.4826 * np.median(np.abs(level - median))       # equals the standard deviation for a bell curve
+    applied_thresh = int(min(254, median + max(sigmas * spread, min_contrast)))
+    return threshold_mask(gray_blurred, applied_thresh), applied_thresh
+
+
 def absolute_fire_mask(temps, seed_temp_c, low_temp_c, min_seed_pixels):
     """
     Fire mask at PROCESS_SIZE from temperatures in °C, by hysteresis at the camera's

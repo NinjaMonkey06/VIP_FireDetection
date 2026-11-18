@@ -239,5 +239,45 @@ class TestBrightBackgroundGate(unittest.TestCase):
         self.assertEqual(gated["summary"]["frames_with_regions"], 1)
 
 
+class TestHotspotMode(unittest.TestCase):
+    def test_small_warm_target_needs_the_hotspot_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            noise = cv2.GaussianBlur(np.random.default_rng(0).normal(0, 1, (512, 640)).astype(np.float32), (0, 0), 4)
+            ground = np.clip(60 + 6 * noise / noise.std(), 0, 255).astype(np.uint8)
+            ground[290:305, 390:410] = 180                              # a 20 x 15 px target
+            video = os.path.join(d, "clip.avi")
+            writer = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*"FFV1"), FPS, (640, 512))
+            if not writer.isOpened():
+                raise unittest.SkipTest("FFV1 video writer not available")
+            writer.write(cv2.cvtColor(ground, cv2.COLOR_GRAY2BGR))
+            writer.release()
+            camera = os.path.join(d, "camera.json")
+            with open(camera, "w") as f:
+                json.dump(CAMERA, f)
+            telemetry = os.path.join(d, "telemetry.csv")
+            with open(telemetry, "w") as f:
+                f.write("frame_id,latitude,longitude,altitude_agl_m,gimbal_yaw_deg,gimbal_pitch_deg,gimbal_roll_deg\n"
+                        "00000,34.15,-117.85,100,0,-90,0\n")
+            found = {}
+            for mode in ("otsu", "hotspot"):
+                out = os.path.join(d, mode)
+                proc = run("--video", video, "--telemetry_csv", telemetry, "--camera_config", camera,
+                           "--output_dir", out, "--threshold_mode", mode)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(os.path.join(out, "geolocated_results.json")) as f:
+                    found[mode] = json.load(f)["results"][0]
+            self.assertEqual(found["otsu"]["fire_regions"], [])
+            self.assertFalse(found["otsu"]["fire_detected"])
+            hot = found["hotspot"]
+            self.assertEqual((hot["threshold_mode"], len(hot["fire_regions"]), hot["fire_detected"]), ("hotspot", 1, True))
+            self.assertEqual(hot["fire_regions"][0]["geolocation_status"], "ok")
+            # 80 px right and 41 px below the centre at 0.3125 m per pixel: 25 m east, 13 m south of the drone
+            c, drone = hot["fire_regions"][0]["gps_centroid"], hot["geolocation"]["drone"]
+            from geoloc.projection import latlon_to_offset
+            north, east = latlon_to_offset(drone["lat"], drone["lon"], c["lat"], c["lon"])
+            self.assertAlmostEqual(float(east), 25.0, delta=1.0)
+            self.assertAlmostEqual(float(north), -13.0, delta=1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,11 @@ Pose. A video carries no per-frame metadata, so it comes from one of:
                             --frame_id_digits (geolocate.py's sidecar format). Only
                             right when no frame was ever dropped, e.g. test videos
                             from experiments/flame3/make_video.py.
+The telemetry's angles are taken as the camera's own (a gimbal reports those). For a
+camera fixed to the drone, give --camera_mount_deg YAW PITCH ROLL: the telemetry then
+holds the drone's attitude (as record_camera.py --mavlink logs it) and the camera's
+direction follows from how it is mounted (0 -90 0 = straight down, top of the picture
+towards the nose).
 Frame times come from the decoder, so dropped frames do not shift the matching. A
 video recorded from a live camera (record_camera.py) does not keep real time: the
 camera delivers frames unevenly while the file claims a fixed rate. Pass its
@@ -23,6 +28,12 @@ frame without usable telemetry is reported as missing_metadata and the run goes 
 Localization. A plain video has no temperatures, so Otsu runs on every frame with
 no detector in front: a frame without fire can still produce regions. For the same
 reason second-level Otsu (localize.py's default) is off unless --second_level_otsu.
+
+--threshold_mode hotspot replaces Otsu with "whatever stands well above the picture's
+typical level". Otsu only isolates fire that fills a sizeable share of the picture; a
+small hot area in a large scene (an early fire, or a heated test target) needs this
+mode. On FLAME 3 it finds regions in 621 of 622 fire frames and 37 of 116 fire-free
+frames (plain Otsu: 517 and 24).
 
 --max_background_gray N is a cheap stand-in for a detector. A thermal camera that
 scales its picture to the scene (auto gain) shows the ground dark once something as
@@ -52,6 +63,7 @@ Usage:
 
 import argparse
 import csv
+import dataclasses
 import json
 import os
 import sys
@@ -65,7 +77,7 @@ import geolocate
 import localize
 from geoloc.camera import load_camera_config
 from geoloc.metadata import MetadataError, SidecarCsvLoader, TimedTelemetryLoader
-from geoloc.projection import CameraPose, ReliabilityLimits, latlon_to_px
+from geoloc.projection import CameraPose, ReliabilityLimits, camera_angles_from_vehicle, latlon_to_px
 from record_camera import load_frame_times
 
 MAX_POINT_LABELS = 40   # a contour with more border points has only every Nth one numbered
@@ -73,6 +85,22 @@ MAX_POINT_LABELS = 40   # a contour with more border points has only every Nth o
 COLORS = [(76, 76, 230), (230, 160, 60), (80, 190, 80), (200, 90, 200), (40, 160, 250),
           (220, 220, 60), (170, 120, 60), (230, 130, 200), (160, 160, 160), (90, 200, 220)]   # BGR
 POINT_COLUMNS = ("frame_id", "video_time_s", "timestamp", *geolocate.CONTOUR_TABLE_COLUMNS[2:])
+
+
+class FixedCameraLoader:
+    """For a camera fixed to the vehicle (no gimbal): the telemetry's angles are the
+    vehicle's attitude, and the camera's own angles follow from how it is mounted
+    (yaw, pitch, roll on a level vehicle; see geoloc.projection.camera_angles_from_vehicle)."""
+
+    def __init__(self, loader, mount_deg):
+        self.loader, self.mount_deg = loader, mount_deg
+
+    def load(self, frame_id, image_path=None):
+        meta = self.loader.load(frame_id, image_path)
+        yaw, pitch, roll = camera_angles_from_vehicle(meta.gimbal_yaw_deg, meta.gimbal_pitch_deg,
+                                                      meta.gimbal_roll_deg, *self.mount_deg)
+        return dataclasses.replace(meta, gimbal_yaw_deg=round(yaw, 3), gimbal_pitch_deg=round(pitch, 3),
+                                   gimbal_roll_deg=round(roll, 3))
 
 
 class ResolvedMetadata:
@@ -103,7 +131,11 @@ def localize_frame(frame_bgr, args):
         return {"localization_run": False, "background_gray": background_gray, "fire_regions": [],
                 "localization_note": f"Skipped: background too bright for a fire scene (median grey "
                                      f"{background_gray:g} > {args.max_background_gray:g})"}
-    if args.second_level_otsu:
+    if args.threshold_mode == "hotspot":
+        mask, applied_thresh = localize.hotspot_fire_mask(gray, args.otsu_blur_kernel, args.hotspot_sigmas,
+                                                          args.hotspot_min_contrast)
+        otsu_thresh, rounds = None, 0
+    elif args.second_level_otsu:
         mask, otsu_thresh, applied_thresh, rounds = localize.second_level_otsu_mask(
             gray, args.otsu_blur_kernel, args.threshold_scale, args.merge_kernel_size, args.max_contour_area)
     else:
@@ -112,6 +144,7 @@ def localize_frame(frame_bgr, args):
     _, contours, regions = localize.regions_from_mask(mask, size, args.merge_kernel_size, args.min_contour_area,
                                                       args.max_contour_area, args.epsilon_factor, args.max_epsilon_px)
     result = {"localization_run": True, "background_gray": background_gray,
+              "threshold_mode": args.threshold_mode,
               "otsu_threshold": otsu_thresh, "applied_threshold": applied_thresh,
               "threshold_scale": args.threshold_scale, "merge_kernel_size": args.merge_kernel_size,
               "n_raw_contours": len(contours), "fire_regions": regions}
@@ -186,6 +219,10 @@ def main():
     source.add_argument("--telemetry_csv",       help="One row per frame (frame_id = frame number), no dropped frames")
     parser.add_argument("--camera_config",    required=True)
     parser.add_argument("--csv_altitude_reference", default="agl", choices=["agl", "takeoff", "msl"])
+    parser.add_argument("--camera_mount_deg", type=float, nargs=3, default=None, metavar=("YAW", "PITCH", "ROLL"),
+                        help="For a camera fixed to the drone (no gimbal): the telemetry's angles are then the "
+                             "drone's attitude, and these are the camera's angles on a level drone. Straight "
+                             "down with the top of the picture towards the nose: 0 -90 0")
     parser.add_argument("--telemetry_max_gap_s", type=float, default=1.0,
                         help="Timed telemetry: a frame farther than this from its nearest sample gets no pose")
     parser.add_argument("--frame_times_csv",  default=None,
@@ -200,6 +237,14 @@ def main():
     parser.add_argument("--tables_dir",       default=None, help="Also write one CSV per contour here")
     # localization (Otsu), localize.py's defaults
     parser.add_argument("--otsu_blur_kernel",  type=int,   default=5)
+    parser.add_argument("--threshold_mode",    default="otsu", choices=["otsu", "hotspot"],
+                        help="otsu: split the picture into a bright and a dark group (default; needs the fire to "
+                             "be a sizeable share of the picture). hotspot: whatever stands well above the "
+                             "picture's typical level, however small (a small fire in a large scene, a test target)")
+    parser.add_argument("--hotspot_sigmas",    type=float, default=6.0,
+                        help="hotspot: how many times the picture's spread above its median (default: 6)")
+    parser.add_argument("--hotspot_min_contrast", type=float, default=25.0,
+                        help="hotspot: and at least this many grey levels above the median (default: 25)")
     parser.add_argument("--second_level_otsu", action="store_true",
                         help="Re-threshold within the bright pixels instead of dropping an oversized region. "
                              "Off by default here: with no detector in front it also adds false alarms")
@@ -284,6 +329,8 @@ def main():
                         loader = ResolvedMetadata(error=e)
             else:
                 loader = per_frame
+            if args.camera_mount_deg:
+                loader = FixedCameraLoader(loader, args.camera_mount_deg)
             c = geolocate.geolocate_results([result], camera, loader, None, args.merge_kernel_size, limits=limits)
             for k in counts:
                 counts[k] += c[k]

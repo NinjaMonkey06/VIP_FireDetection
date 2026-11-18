@@ -257,5 +257,43 @@ class TestAbsoluteModeCommandLine(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
 
 
+def textured_ground(seed=0, level=60, spread=6):
+    """256x256: ground with gentle texture and nothing hot."""
+    noise = cv2.GaussianBlur(np.random.default_rng(seed).normal(0, 1, (256, 256)).astype(np.float32), (0, 0), 2)
+    return np.clip(level + spread * noise / noise.std(), 0, 255).astype(np.uint8)
+
+
+class TestHotspotThreshold(unittest.TestCase):
+    """A small hot area in a large scene: too few pixels for Otsu to treat as a group."""
+
+    def scene_with_small_target(self):
+        g = textured_ground()
+        g[120:126, 150:158] = 180          # 8 x 6 px: 0.07% of the picture
+        return g
+
+    def test_small_target_is_outlined_where_otsu_gives_nothing(self):
+        g = self.scene_with_small_target()
+        self.assertEqual(len(regions_of(localize.otsu_fire_mask(g, 5, 0.85)[0])), 0)
+        self.assertEqual(len(regions_of(localize.second_level_otsu_mask(g, 5, 0.85, 15, 50000)[0])), 0)
+        mask, applied = localize.hotspot_fire_mask(g, 5)
+        regions = regions_of(mask)
+        self.assertEqual(len(regions), 1)
+        x, y, w, h = cv2.boundingRect(regions[0])
+        self.assertTrue(x < 154 < x + w and y < 123 < y + h)
+        self.assertGreaterEqual(applied, 60 + 25)
+
+    def test_ground_alone_gives_no_region(self):
+        for seed in range(5):
+            mask, _ = localize.hotspot_fire_mask(textured_ground(seed, spread=15), 5)
+            self.assertEqual(len(regions_of(mask)), 0)
+
+    def test_threshold_follows_the_spread_of_the_picture(self):
+        quiet = localize.hotspot_fire_mask(textured_ground(spread=2), 5)[1]
+        busy = localize.hotspot_fire_mask(textured_ground(spread=15), 5)[1]
+        self.assertAlmostEqual(quiet, 60 + 25, delta=2)            # the minimum contrast decides
+        self.assertGreater(busy, quiet + 20)                       # six times a wider spread decides
+        self.assertLessEqual(localize.hotspot_fire_mask(np.full((256, 256), 250, np.uint8), 5)[1], 254)
+
+
 if __name__ == "__main__":
     unittest.main()

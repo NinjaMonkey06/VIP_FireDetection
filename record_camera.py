@@ -23,6 +23,9 @@ Outputs in --output_dir:
                             jumps) and utc_time (this computer's clock, ISO 8601)
     recording.json          source, frame size, nominal and measured frame rate,
                             frame count, start and end time
+    telemetry.csv           with --mavlink: the drone's position and attitude from its
+                            flight controller, timed on the same clock as the frames
+                            (mavlink_telemetry.py)
 
 Stop with Ctrl+C, with q in the preview window (--preview), or after --duration_s.
 The files are complete whichever way it stops.
@@ -110,10 +113,11 @@ def open_source(source, width=None, height=None, fps=None):
 
 
 def record(cap, output_dir, codec="mp4v", fps=None, duration_s=None, max_frames=None, preview=False,
-           clock=time.monotonic, wall_clock=time.time, log=None):
+           clock=time.monotonic, wall_clock=time.time, log=None, telemetry=None):
     """Records frames from an open capture until it ends, duration_s or max_frames is
     reached, or the user stops it. Returns the summary that is also written to
-    recording.json."""
+    recording.json. telemetry: a mavlink_telemetry.TelemetryLogger, told when the first
+    frame arrives so its times count from that frame, and stopped with the recording."""
     log = log or (lambda text: None)
     os.makedirs(output_dir, exist_ok=True)
     filename, fourcc = CODECS[codec]
@@ -149,6 +153,8 @@ def record(cap, output_dir, codec="mp4v", fps=None, duration_s=None, max_frames=
                     if not writer.isOpened():
                         raise OSError(f"cannot write {filename} with codec {codec}; try another --codec")
                     t0, start_utc = now, utc
+                    if telemetry is not None:
+                        telemetry.start(t0)
                     log(f"[✓] Recording {width}x{height} to {os.path.join(output_dir, filename)} "
                         f"(nominal {nominal_fps:g} fps). Stop with Ctrl+C" + (" or q" if preview else ""))
                 writer.write(frame)
@@ -175,6 +181,7 @@ def record(cap, output_dir, codec="mp4v", fps=None, duration_s=None, max_frames=
                 writer.release()
             if preview:
                 cv2.destroyAllWindows()
+            telemetry_summary = telemetry.stop() if telemetry is not None else None
 
     if frames == 0:
         raise OSError("the camera opened but delivered no frames")
@@ -185,6 +192,8 @@ def record(cap, output_dir, codec="mp4v", fps=None, duration_s=None, max_frames=
                "start_utc": datetime.fromtimestamp(start_utc, timezone.utc).isoformat(timespec="milliseconds"),
                "end_utc": datetime.fromtimestamp(start_utc + last_t, timezone.utc).isoformat(timespec="milliseconds"),
                "stopped_by": stopped_by}
+    if telemetry_summary is not None:
+        summary["telemetry"] = telemetry_summary
     with open(os.path.join(output_dir, "recording.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     return summary
@@ -218,14 +227,30 @@ def main():
     parser.add_argument("--fps", type=float, default=None, help="Frame rate to ask the camera for")
     parser.add_argument("--duration_s", type=float, default=None, help="Stop after this many seconds")
     parser.add_argument("--preview", action="store_true", help="Show the picture while recording; q stops")
+    parser.add_argument("--mavlink", default=None, metavar="CONNECTION",
+                        help="Also log the drone's position and attitude from its flight controller into "
+                             "telemetry.csv, on the video's clock. E.g. /dev/ttyACM0 (USB), /dev/serial0,57600 "
+                             "(serial pins and baud rate), udpin:0.0.0.0:14550 (see mavlink_telemetry.py)")
+    parser.add_argument("--telemetry_rate_hz", type=float, default=20.0,
+                        help="Attitude and position messages per second to ask the flight controller for (default: 20)")
     args = parser.parse_args()
 
+    telemetry = None
     try:
+        if args.mavlink:        # first, so a dead telemetry link is known before the camera starts
+            import mavlink_telemetry
+            link = mavlink_telemetry.connect(args.mavlink, args.telemetry_rate_hz)
+            print(f"[✓] Flight controller found on {args.mavlink}")
+            os.makedirs(args.output_dir, exist_ok=True)
+            telemetry = mavlink_telemetry.TelemetryLogger(link, os.path.join(args.output_dir, "telemetry.csv"))
         cap = open_source(args.source, args.width, args.height, args.fps)
     except OSError as e:
+        if telemetry is not None:
+            telemetry.stop()
         parser.error(str(e))
     try:
-        summary = record(cap, args.output_dir, args.codec, args.fps, args.duration_s, preview=args.preview, log=print)
+        summary = record(cap, args.output_dir, args.codec, args.fps, args.duration_s, preview=args.preview, log=print,
+                         telemetry=telemetry)
     except OSError as e:
         parser.error(str(e))
     finally:
@@ -233,9 +258,21 @@ def main():
 
     print(f"[✓] Stopped: {summary['stopped_by']}. {summary['frames']} frames in {summary['duration_s']:.1f} s "
           f"({summary['measured_fps']} fps measured, {summary['nominal_fps']:g} nominal)")
-    print(f"[✓] Saved in {args.output_dir}/: {summary['video']}, frame_times.csv, recording.json")
-    print(f"[✓] Process with: python process_video.py --video {os.path.join(args.output_dir, summary['video'])} "
-          f"--frame_times_csv {os.path.join(args.output_dir, 'frame_times.csv')} ...")
+    saved = f"{summary['video']}, frame_times.csv, recording.json"
+    command = (f"python process_video.py --video {os.path.join(args.output_dir, summary['video'])} "
+               f"--frame_times_csv {os.path.join(args.output_dir, 'frame_times.csv')}")
+    if telemetry is not None:
+        t = summary["telemetry"]
+        print(f"[✓] Telemetry: {t['samples']} samples" + (f" at {t['rate_hz']} per second" if t["rate_hz"] else "")
+              + (f"; {t['attitude_without_position']} attitude messages had no position yet (no GPS fix?)"
+                 if t["attitude_without_position"] else ""))
+        if t["samples"] == 0:
+            print("[!] No telemetry was logged: the flight controller sent no attitude with a position")
+        saved += ", telemetry.csv"
+        command += (f" --timed_telemetry_csv {os.path.join(args.output_dir, 'telemetry.csv')} "
+                    f"--csv_altitude_reference takeoff --camera_mount_deg 0 -90 0")
+    print(f"[✓] Saved in {args.output_dir}/: {saved}")
+    print(f"[✓] Process with: {command} ...")
 
 
 if __name__ == "__main__":

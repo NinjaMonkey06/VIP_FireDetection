@@ -105,12 +105,13 @@ A subsample of **5,000 frame pairs** was used, selected via regular interval sam
 ├── visualize_geolocation.py  # draws geolocate.py results on the thermal frames
 ├── process_video.py    # localization + geolocation on a thermal video, frame by frame
 ├── record_camera.py    # records video from a camera, with the capture time of every frame
+├── mavlink_telemetry.py # logs the drone's position and attitude from its flight controller (MAVLink)
 ├── srt_to_telemetry.py # per-frame telemetry CSV from a drone video's .SRT subtitle track
 ├── geoloc/             # Camera-agnostic geolocation library (no rendering code)
 │   ├── camera.py       #   CameraConfig: intrinsics / FOV type, distortion, crop, metadata fields
 │   ├── metadata.py     #   FrameMetadata + loaders (EXIF/XMP, sidecar CSV)
 │   └── projection.py   #   Pure math: pixel → ray → ground → lat/lon
-├── camera_configs/     # dji_m30t_thermal.json (FLAME 3), dji_mini4pro.json (sample), template.json
+├── camera_configs/     # ct_ei5btc_m.json (flight-test camera), dji_m30t_thermal.json (FLAME 3), dji_mini4pro.json (sample), template.json
 ├── experiments/flame3/ # FLAME 3 checks: thermal FOV, laser rangefinder, Otsu vs absolute, video, pose offsets
 ├── tests/              # unittest suite (synthetic inputs, plus the saved results/flame2_sample output)
 ├── docs/               # geolocation_worked_example.md (one pixel projected by hand), progress reports
@@ -367,11 +368,12 @@ python geolocate.py \
 
 **Sidecar CSV columns:** `frame_id, latitude, longitude, altitude_agl_m, gimbal_yaw_deg, gimbal_pitch_deg, gimbal_roll_deg[, timestamp]` — yaw clockwise from north, pitch `-90` = straight down, timestamp ISO 8601. Every column except `timestamp` must be filled; frames with missing metadata are reported as `missing_metadata` and never projected with guessed values.
 
-**Camera configs (`camera_configs/`).** All camera-specific values live here, so swapping cameras is a config change. The final camera is not confirmed yet (a FLIR Hadron is the likely candidate); copy `template.json` once it is.
+**Camera configs (`camera_configs/`).** All camera-specific values live here, so swapping cameras is a config change. For another camera, copy `template.json`.
 - Intrinsics: either `fx, fy[, cx, cy]` from a checkerboard calibration (preferred) or `fov_deg` + `fov_type` (`horizontal` / `vertical` / `diagonal`). The FOV type is mandatory because most datasheets quote **diagonal** FOV.
 - `dist_coeffs` (OpenCV order), optional `crop`, `altitude_reference`, and a `metadata_fields` mapping for the EXIF/XMP loader (`xmp:<prefix:Name>`, `exif:<TagName>` or `const:<value>`).
 - Intrinsics are rescaled to each image's resolution, but only for a plain resize: if the image's aspect ratio differs from the calibrated frame by more than rounding, it is rejected — add a `crop` entry instead.
 - `dji_mini4pro.json` is a **sample only**, ported from the reference pipeline: 82.1° **diagonal** FOV (only the diagonal reading is consistent with DJI's 24 mm-equivalent spec).
+- `ct_ei5btc_m.json` is the camera for the campus flight test: a CT-EI5BTC-M thermal module, 640 × 512, read over USB like a webcam (`record_camera.py`). Its intrinsics are the datasheet's (45.7° horizontal FOV, consistent with its 9.1 mm lens and 12 µm pixels: fx = 759 px), not calibrated. It is not radiometric, so localization uses Otsu, and it should be set to the white-hot palette so that grey level rises with temperature.
 - `dji_m30t_thermal.json` is the DJI M30T thermal camera used in the FLAME 3 dataset. Its intrinsics were measured by registering thermal frames to the wide camera (`experiments/flame3/measure_thermal_fov.py`): square pixels, fx = 697 px (matches DJI's 61° diagonal FOV), principal point off-centre at (334, 266). Pose comes from the paired raw RGB (`--exif_image_dir <class>/RGB/Raw`). The measurement and check scripts are in `experiments/flame3/`.
 
 > **Note on this repo's sample frames:** the thermal images behind `results/flame2_sample/` are 958 × 760, not FLAME-2's native 640 × 512, so they were resized and/or cropped during RGB–thermal alignment. To geolocate them, the camera config must describe that processed frame (its own intrinsics, or the native calibration plus a `crop`).
@@ -466,6 +468,7 @@ Frame times come from the decoder, so dropped frames do not shift the matching. 
 | `<--tables_dir>/` | optional: one CSV per contour, as `geolocate.py --tables_dir` |
 
 - **Localization:** plain video has no temperatures, so this uses Otsu on every frame, with no detector in front. Its parameters and the reliability limits match `localize.py` and `geolocate.py`, except that second-level Otsu is off unless `--second_level_otsu`: without a detector it also turns more fire-free frames into false alarms.
+- **Hot-spot mode (optional):** `--threshold_mode hotspot` outlines whatever stands well above the picture's typical level: brighter than the median by `--hotspot_sigmas` (default 6) times the picture's spread, and by at least `--hotspot_min_contrast` (default 25) grey levels. Otsu splits the picture into two groups, so it only isolates fire that fills a sizeable share of the picture; a small hot area in a large scene (an early fire, a heated test target) is too few pixels, and Otsu then cuts the background in two. In simulated scenes a 12 × 9 px target was missed by Otsu every time and found by this mode every time, with no regions in target-free scenes. On FLAME 3 it finds regions in 621 of 622 fire frames and 37 of 116 fire-free frames (plain Otsu: 517 and 24), with 91.7% of the area above 80 °C inside the outlines (plain Otsu: 92.8%).
 - **Background gate (optional):** `--max_background_gray N` skips a frame whose median grey level is above N. A camera that scales its picture to the scene shows the ground dark once fire is in view and mid-grey when there is none. It is off by default because it depends on the camera's gain behaviour: 60 suited FLAME 3's DJI M30T, the only camera it was tried on. Every frame's result carries `background_gray`, so the limit can be checked on new footage. A skipped frame has `fire_detected: false` and no regions.
 - **Slower hardware:** `--frame_step N` processes every Nth frame; skipped frames are not decoded and keep their times.
 
@@ -494,6 +497,8 @@ python process_video.py   --video results/flight_01/recording/video.mp4   --fram
 | `--width`, `--height`, `--fps` | camera's own | Requests to the camera; it may give something else, and `recording.json` says what it gave |
 | `--duration_s` | off | Stop after this many seconds |
 | `--preview` | off | Show the picture while recording; `q` stops |
+| `--mavlink` | off | Also log the drone's telemetry from its flight controller into `telemetry.csv`: a connection such as `/dev/ttyACM0` (USB), `/dev/serial0,57600` (serial pins, baud rate) or `udpin:0.0.0.0:14550` |
+| `--telemetry_rate_hz` | `20` | Attitude and position messages per second to ask the flight controller for |
 
 Stop with Ctrl+C, `q` in the preview, or `--duration_s`. It writes `video.mp4` (or `.avi`), `frame_times.csv` (`frame_index, time_s, utc_time`) and `recording.json` (frame size, nominal and measured frame rate, start and end time).
 
@@ -502,6 +507,18 @@ Stop with Ctrl+C, `q` in the preview, or `--duration_s`. It writes `video.mp4` (
 - Use `--codec mjpg`, the lightest on the Pi's processor, and `--duration_s` or Ctrl+C over SSH instead of `--preview`.
 - A Pi has no battery-backed clock: without a network it starts with the wrong date, so `utc_time` is wrong unless the clock is set before the flight. `time_s` is not affected.
 - The `picamera` source is tested against a stand-in for the library, not yet on a real Pi.
+
+**Telemetry from the flight controller.** On a drone with a MAVLink flight controller (a Pixhawk running PX4 or ArduPilot, as on the Holybro X500), the recording computer can log the drone's position itself, on the same clock as the frames, so no clocks have to be matched afterwards. It needs `pymavlink` (`pip install pymavlink`).
+
+```bash
+python record_camera.py --source 0 --codec mjpg --mavlink /dev/ttyACM0 --output_dir flight_01
+python process_video.py --video flight_01/video.avi --frame_times_csv flight_01/frame_times.csv --timed_telemetry_csv flight_01/telemetry.csv --csv_altitude_reference takeoff --camera_mount_deg 0 -90 0 --camera_config camera_configs/ct_ei5btc_m.json --output_dir results/flight_01 --annotate
+```
+
+- The recorder waits for the flight controller's heartbeat before it starts, so a dead link is known on the ground. If the link drops later, the video keeps recording.
+- `telemetry.csv` has one row per attitude message with the latest position: `time_s` (seconds since the first frame), `latitude`, `longitude`, `altitude_agl_m` (height above the take-off point, hence `--csv_altitude_reference takeoff`), the drone's yaw, pitch and roll, plus `position_age_s`, `gps_fix_type` and `satellites` for checking the data.
+- **Fixed camera.** Without a gimbal the camera tilts with the drone, and the telemetry holds the drone's attitude, not the camera's. `process_video.py --camera_mount_deg YAW PITCH ROLL` gives the camera's angles on a level drone, and the two are combined for every frame. `0 -90 0` is straight down with the top of the picture towards the nose. The mount is applied when processing, so it can be corrected after the flight.
+- Tested with stand-ins for the flight controller and for `pymavlink`, not yet against the library itself or a real flight controller.
 
 **Why the frame times.** A camera does not deliver frames at exactly the rate the video file claims, so the file's clock drifts from real time: 0.08 s in a 5 s webcam test, which would be about 10 s over a 10-minute flight. With `--frame_times_csv`, `process_video.py` uses each frame's real capture time (`time_s`, seconds since the first frame) to pick the drone's pose. The telemetry's `time_s` must count from the same instant: the recording's first frame, whose UTC time is `start_utc` in `recording.json`. `utc_time` comes from the recording computer's clock, so set that clock before a flight if the telemetry is stamped by GPS time.
 
@@ -603,7 +620,8 @@ Stop with Ctrl+C, `q` in the preview, or `--duration_s`. It writes `video.mp4` (
 | `localize.py` | Phase 2 localization — Otsu → dilation → contour extraction → JSON/GeoJSON/CSV + optional 5-panel visualizations |
 | `geolocate.py` | Phase 3 — projects fire contours to GPS polygons, centroids and ground areas using per-frame metadata (EXIF/XMP or sidecar CSV) and a camera config |
 | `visualize_geolocation.py` | Draws `geolocate.py` results on the thermal frames: numbered border points per contour, distance, areas, ground-distance rings, reliability limit, horizon |
-| `record_camera.py` | Records video from a camera (number, stream URL or file) with the real capture time of every frame, for `process_video.py --frame_times_csv` |
+| `record_camera.py` | Records video from a camera (number, stream URL or file) with the real capture time of every frame, for `process_video.py --frame_times_csv`; with `--mavlink`, also the drone's telemetry |
+| `mavlink_telemetry.py` | Logs position and attitude from a MAVLink flight controller (Pixhawk: PX4 or ArduPilot) into the timed telemetry CSV, on the video's clock |
 | `process_video.py` | Localization + geolocation on a thermal video, frame by frame, with pose matched by time (or frame number) from a telemetry CSV; streams `frames.jsonl`, `border_points.csv`, `fire_borders.geojson`, optional annotated video |
 | `srt_to_telemetry.py` | Timed telemetry CSV from a drone video's `.SRT` subtitle track (DJI layout, configurable keys) |
 | `geoloc/` | Geolocation library: `camera.py` (config), `metadata.py` (loaders), `projection.py` (pure geometry) |
@@ -657,7 +675,7 @@ RGB [B, 3, 256, 256]      Thermal [B, 1, 256, 256]
 - **Flat-ground geolocation** — rays are intersected with a horizontal plane at the drone's altitude above ground. In hilly terrain the error grows with height error × tan(off-nadir angle) (e.g. 20 m of relief at 30° off-axis ≈ 11.5 m). A DEM can be added behind the `Terrain` interface in `geoloc/projection.py`.
 - **Altitude reference** — DJI `RelativeAltitude` is height above the take-off point, not above the ground under the drone; it equals AGL only on terrain level with take-off. Such frames carry a warning. An altitude error δh moves every point by about δh / h of its range. On FLAME 3 (Sycan Marsh) an SRTM elevation model shows the burn area is flat (a few metres of relief), so take-off altitude is a reasonable AGL there. Over hilly ground a DEM behind the `Terrain` interface is the general fix (not built yet).
 - **Laser-rangefinder height is unreliable over trees and smoke** — the laser measures the first surface it hits. On FLAME 3 only ~27% of laser readings hit the ground (within ±3 m of SRTM); most hit canopy or smoke 3–60 m higher, which makes `--altitude_source laser` heights too low. The comparison in `experiments/flame3/laser_check.py` therefore checks angle conventions, not ground accuracy.
-- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against DJI's own laser projection, which shares the gimbal angles, so absolute accuracy is untested. One check without ground truth: consecutive video frames taken 43 m apart agree best with the yaw as recorded (0° to −3°), which rules out a bias the size of the magnetic declination (`experiments/flame3/pose_offset_check.py`, `results/run_E_refined/`). An error that moves every frame the same way would not show there. Surveyed ground control points (FLAME 3 NADIR plots) are the next step. The final camera is not confirmed.
+- **No surveyed validation yet** — the math is unit-tested against hand-computed cases and checked against DJI's own laser projection, which shares the gimbal angles, so absolute accuracy is untested. One check without ground truth: consecutive video frames taken 43 m apart agree best with the yaw as recorded (0° to −3°), which rules out a bias the size of the magnetic declination (`experiments/flame3/pose_offset_check.py`, `results/run_E_refined/`). An error that moves every frame the same way would not show there. Surveyed ground control points (FLAME 3 NADIR plots) are the next step.
 - **Outlines are fire zones** — `localize.py`'s region-merging dilation joins nearby hot spots into one outline, so `ground_area_m2` covers the hot spots, the gaps between them and a margin around them. On FLAME 3 the hot pixels are a median ~15% of the outline. `fire_area_m2` is the ground area of the hot pixels themselves. Border coordinates sit outside the hot pixels by that margin: 7 px at 256×256 in the image, but on the ground it depends on the direction and on how far away the region is. On the 34 test frames it is a median 6 m sideways and 16 m away from the drone, over 30 m for one region in ten, and up to 62 m for the farthest. Each region reports its own in `dilation_buffer_range_m`; the frame's single `dilation_buffer_m` (median 5.5 m) is only the sideways value at the image centre. For the same reason, hot spots far from the drone are merged across larger gaps than near ones.
 - **No lever-arm or time-sync correction** — the GPS antenna is assumed to be at the camera, and metadata is assumed to be captured at the same instant as the frame.
 
